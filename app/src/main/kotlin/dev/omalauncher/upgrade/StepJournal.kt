@@ -39,18 +39,20 @@ class StepJournal(
         save()
     }
 
-    /** A fresh rootfs: nothing has run on it. */
+    /** A fresh rootfs: nothing has run on it. Saved first: if that fails, the journal still says what's on disk. */
     fun reset() {
+        save(false, emptyList())
         done.clear()
         setupComplete = false
-        save()
     }
 
-    private fun save() =
-        writeAtomically(
-            file,
-            Versioned.write(VERSION, JSONObject().put("setup", setupComplete).put("done", JSONArray(done.sorted()))).toByteArray(),
-        )
+    private fun save(
+        setup: Boolean = setupComplete,
+        ids: Collection<String> = done,
+    ) = writeAtomically(
+        file,
+        Versioned.write(VERSION, JSONObject().put("setup", setup).put("done", JSONArray(ids.sorted()))).toByteArray(),
+    )
 
     private companion object {
         const val VERSION = 1

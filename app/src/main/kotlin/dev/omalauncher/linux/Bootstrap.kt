@@ -7,23 +7,20 @@ import dev.omalauncher.LauncherData
 import dev.omalauncher.upgrade.Provisioner
 import dev.omalauncher.upgrade.StepJournal
 import dev.omalauncher.upgrade.writeAtomically
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
-import java.io.BufferedInputStream
 import java.io.File
-import java.io.FilterInputStream
-import java.io.InputStream
-import java.net.HttpURLConnection
 import java.net.URL
-import java.util.zip.GZIPInputStream
 
 private const val TAG = "bootstrap"
-private const val ROOTFS_URL = "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
-private const val TARBALL = "ArchLinuxARM-aarch64-latest.tar.gz"
 
 /** Attempts per network step before setup (or an update) reports a failure. */
 private const val NETWORK_TRIES = 3
@@ -139,8 +136,33 @@ class Bootstrap(
     private val _updates = MutableStateFlow<JobState>(JobState.Idle)
     val updates = _updates.asStateFlow()
 
+    /**
+     * Why removing Linux, or deleting what an earlier removal left, didn't fully work; null when
+     * it did. The Linux screen shows it; it clears when the next removal or install starts.
+     */
+    private val _removalProblem = MutableStateFlow<String?>(null)
+    val removalProblem = _removalProblem.asStateFlow()
+
     private val log = OutputTail(200)
     private val journal = StepJournal(File(proot.filesDir, "rootfs-steps.json"))
+
+    /** A finished setup owns the rootfs: the journal says so, or an older launcher's rootfs-ready. */
+    private val setUp get() = journal.setupComplete || File(proot.filesDir, "rootfs-ready").exists()
+
+    /** One of [run], [install] and [remove] at a time: none may see another's half-done state. */
+    private val lifecycle = Mutex()
+
+    private val rootfsInstaller =
+        RootfsInstaller(
+            proot.filesDir,
+            setUp = { setUp },
+            forgetOldRootfs = {
+                journal.reset()
+                provisioner.forgetAll()
+            },
+            deleteTree = LauncherData::deleteTree,
+            report = ::report,
+        )
 
     /** The agents picked when installing Linux, one bin per line; its existence means an install was started. */
     private val choiceFile get() = File(proot.filesDir, "setup-agents")
@@ -178,13 +200,17 @@ class Bootstrap(
 
     /**
      * Runs the step; one that needs the network gets a few tries, since phone connections drop.
-     * Retrying is cheap: pacman keeps what it already downloaded, and downloads resume.
+     * Retrying is cheap: pacman keeps what it already downloaded, and downloads resume. A
+     * failure another try can't fix (a tarball that doesn't match its signature) ends it.
      */
     private suspend fun Step.attempt() {
         repeat(if (network) NETWORK_TRIES - 1 else 0) { n ->
             try {
                 return run()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
+                if (e is RootfsException && !e.kind.retryable) throw e
                 log.add("${e.message}; trying again (${n + 2} of $NETWORK_TRIES)")
                 kotlinx.coroutines.delay(5_000L * (n + 1))
             }
@@ -211,31 +237,58 @@ class Bootstrap(
      * installed system, or continues an install that was started (also
      * after the app was killed during it). Otherwise reports NotInstalled.
      */
-    suspend fun run() =
-        withContext(Dispatchers.IO) {
-            try {
-                adoptLegacySetup()
-                when {
-                    journal.setupComplete -> update()
-                    !choiceFile.exists() -> {
-                        _state.value = LinuxState.NotInstalled
-                        // Left by a removal that didn't finish (the app was killed, or a file resisted).
-                        if (proot.rootfs.exists()) runCatching { LauncherData.deleteTree(proot.rootfs) }.onFailure { Log.e(TAG, "leftover rootfs", it) }
-                        return@withContext
-                    }
-                    else -> setup()
+    suspend fun run() = withContext(Dispatchers.IO) { lifecycle.withLock { runLocked() } }
+
+    private suspend fun runLocked() {
+        try {
+            adoptLegacySetup()
+            when {
+                journal.setupComplete -> update()
+                !choiceFile.exists() -> {
+                    // Before NotInstalled offers an install: nothing may still be deleting when one starts.
+                    clearLeftovers()
+                    _state.value = LinuxState.NotInstalled
+                    return
                 }
-                _state.value = LinuxState.Installed
-            } catch (e: Exception) {
-                Log.e(TAG, "setup failed", e)
-                _state.value = LinuxState.Failed(stage, e.message ?: e.toString(), log.toList())
+                else -> setup()
+            }
+            _state.value = LinuxState.Installed
+        } catch (e: Exception) {
+            Log.e(TAG, "setup failed", e)
+            _state.value = LinuxState.Failed(stage, e.message ?: e.toString(), log.toList())
+        }
+    }
+
+    /**
+     * Starts installing Linux with [picked] coding agents; see [run]. A fresh install first
+     * deletes what a removal left; if that fails it doesn't start, and [removalProblem] says why.
+     */
+    suspend fun install(picked: List<Agent>) =
+        withContext(Dispatchers.IO) {
+            lifecycle.withLock {
+                if (!setUp && !choiceFile.exists() && !clearLeftovers()) return@withLock
+                choose(picked)
+                runLocked()
             }
         }
 
-    /** Starts installing Linux with [picked] coding agents; see [run]. */
-    suspend fun install(picked: List<Agent>) {
-        choose(picked)
-        run()
+    /**
+     * Deletes what a removal that didn't finish left (the app was killed, or a file resisted);
+     * true once nothing is left. Only while nothing is set up: [run] and [install] check.
+     */
+    private fun clearLeftovers(): Boolean {
+        val cause =
+            when (val removal = rootfsInstaller.remove()) {
+                RootfsInstaller.Removal.Done -> {
+                    _removalProblem.value = null
+                    return true
+                }
+                is RootfsInstaller.Removal.Kept -> removal.cause
+                is RootfsInstaller.Removal.Leftovers -> removal.cause
+            }
+        Log.e(TAG, "leftover rootfs", cause)
+        _removalProblem.value = "Files of a removed Linux couldn't be deleted (${cause.message}). Linux can be installed again once they are; try again, or restart the launcher."
+        return false
     }
 
     /**
@@ -244,23 +297,47 @@ class Bootstrap(
      */
     suspend fun remove() =
         withContext(Dispatchers.IO) {
-            _state.value = LinuxState.Removing
-            backlog = emptyList()
-            pacman.lock.withLock {
-                try {
-                    LauncherData.deleteTree(proot.rootfs)
-                } catch (e: Exception) {
-                    // Whatever is left can't run; a later install unpacks over a fresh directory anyway.
-                    Log.e(TAG, "rootfs not fully deleted", e)
+            lifecycle.withLock {
+                _removalProblem.value = null
+                _state.value = LinuxState.Removing
+                val removal =
+                    pacman.lock.withLock {
+                        rootfsInstaller.remove(
+                            forget = {
+                                // The record that an install was started, then the journal: once that's reset nothing
+                                // will run or update this system, and a start in between still finds it set up.
+                                check(!choiceFile.exists() || choiceFile.delete()) { "can't delete ${choiceFile.name}" }
+                                journal.reset()
+                            },
+                        )
+                    }
+                if (removal is RootfsInstaller.Removal.Kept) {
+                    // Nothing was deleted: Linux stays installed, and the Linux screen says why.
+                    Log.e(TAG, "Linux not removed", removal.cause)
+                    _removalProblem.value = "Linux wasn't removed: ${removal.cause.message}. Your Linux files were kept; try again."
+                    _state.value = LinuxState.Installed
+                    return@withLock
                 }
-                journal.reset()
-                provisioner.forgetAll()
-                choiceFile.delete()
+                backlog = emptyList()
+                try {
+                    provisioner.forgetAll()
+                } catch (e: Exception) {
+                    // Forgotten again before the next install's rootfs is switched in.
+                    Log.e(TAG, "provisioned files not forgotten", e)
+                }
                 proot.keymap.delete()
-                context.cacheDir.listFiles { f -> f.name.startsWith(TARBALL) }?.forEach { it.delete() }
+                // Downloads and the private copy of a pushed tarball; a tarball the user pushed stays.
+                context.cacheDir.listFiles { f -> f.name.startsWith(ROOTFS_TARBALL) }?.forEach { it.delete() }
                 log.clear()
+                if (removal is RootfsInstaller.Removal.Leftovers) {
+                    // Nothing left can run or pass for a rootfs; deleting goes on before the next install, or at the next start.
+                    Log.e(TAG, "rootfs not fully deleted", removal.cause)
+                    _removalProblem.value =
+                        "Linux is removed, but some of its files couldn't be deleted (${removal.cause.message}). " +
+                        "They're deleted when the launcher next starts, or before Linux is installed again."
+                }
+                _state.value = LinuxState.NotInstalled
             }
-            _state.value = LinuxState.NotInstalled
         }
 
     /**
@@ -363,121 +440,37 @@ class Bootstrap(
         _state.value = LinuxState.Installing(stage, step, progress, log.toList())
     }
 
-    /** Always a fresh unpack: this step only runs until one completed, so a rootfs here is a half-unpacked one. */
-    private fun installRootfs() {
-        // Unpacking replaces the rootfs: the user's home, packages and agents. Only ever before a setup finished.
-        check(!journal.setupComplete && !File(proot.filesDir, "rootfs-ready").exists()) { "refusing to replace a set-up system" }
-        val tarball = obtainTarball()
-        try {
-            extract(tarball)
-        } catch (e: Exception) {
-            // A truncated or bogus download (a captive portal's page) would fail every retry otherwise.
-            if (tarball.parentFile == context.cacheDir) tarball.delete()
-            throw e
-        }
-        tarball.delete() // ~830 MB we no longer need
-    }
-
     /**
-     * Prefers a tarball pushed via adb to the app's external files dir; downloads otherwise.
-     * An interrupted download resumes where it stopped, as long as the file on the server is
-     * still the same one (If-Range): "latest" moves, and two versions mustn't be spliced.
+     * Gets Arch Linux ARM's tarball, checks its signature against the pinned build key, and
+     * unpacks it beside the rootfs, which it then replaces in one rename; see [RootfsInstaller].
+     * This step only runs until one completed, so a rootfs here is a half-made one. A set-up
+     * system is never replaced: it holds the user's home, packages and agents.
      */
-    private fun obtainTarball(): File {
-        val external = context.getExternalFilesDir(null)?.let { File(it, TARBALL) }
-        if (external != null && external.exists()) return external
-        val target = File(context.cacheDir, TARBALL)
-        if (target.exists()) return target
-        val partial = File(context.cacheDir, "$TARBALL.part")
-        val validator = File(context.cacheDir, "$TARBALL.version")
-        report(Stage.Download, "Downloading Arch Linux ARM", 0f)
-        val conn = URL(ROOTFS_URL).openConnection() as HttpURLConnection
-        conn.connectTimeout = 15_000
-        conn.readTimeout = 30_000
-        val have = if (partial.exists() && validator.exists()) partial.length() else 0L
-        if (have > 0) {
-            conn.setRequestProperty("Range", "bytes=$have-")
-            conn.setRequestProperty("If-Range", validator.readText())
-        }
-        val resumed = conn.responseCode == HttpURLConnection.HTTP_PARTIAL
-        if (conn.responseCode !in 200..299) error("download failed: HTTP ${conn.responseCode}")
-        val start = if (resumed) have else 0L
-        val total = conn.contentLengthLong.let { if (it > 0) it + start else -1L }
-        (conn.getHeaderField("ETag") ?: conn.getHeaderField("Last-Modified"))?.let(validator::writeText) ?: validator.delete()
-        conn.inputStream.use { input ->
-            java.io.FileOutputStream(partial, resumed).use { out ->
-                val buf = ByteArray(1 shl 16)
-                var done = start
-                var lastReport = 0L
-                while (true) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    out.write(buf, 0, n)
-                    done += n
-                    if (done - lastReport > 4 shl 20) {
-                        lastReport = done
-                        report(
-                            Stage.Download,
-                            if (total > 0) "${done shr 20} of ${total shr 20} MB" else "${done shr 20} MB",
-                            if (total > 0) done.toFloat() / total else null,
-                        )
-                    }
-                }
+    private suspend fun installRootfs() {
+        val job = currentCoroutineContext()[Job]
+        val ensureActive = { job?.ensureActive() ?: Unit }
+        val downloader =
+            RootfsDownloader(context.cacheDir, ensureActive = ensureActive) { done, total ->
+                report(
+                    Stage.Download,
+                    if (total > 0) "${done shr 20} of ${total shr 20} MB" else "${done shr 20} MB",
+                    if (total > 0) done.toFloat() / total else null,
+                )
             }
+        val verifier = RootfsVerifier(context.assets.open(ROOTFS_SIGNER_ASSET).use { it.readBytes() })
+        val source = RootfsSource(context.cacheDir, context.getExternalFilesDir(null), verifier, downloader, ensureActive = ensureActive) { step, progress ->
+            report(Stage.Download, step, progress)
         }
-        // Only a complete download is kept for a retry.
-        check(total <= 0 || partial.length() == total) { "the download was cut short; retry to continue it" }
-        partial.renameTo(target)
-        validator.delete()
-        return target
+        val extractor =
+            RootfsExtractor(
+                symlink = { target, path -> Os.symlink(target, path) },
+                ensureActive = ensureActive,
+                progress = { count, fraction -> report(Stage.Extract, "$count files", fraction) },
+            )
+        rootfsInstaller.install(source, extractor)
+        // Proot.prepare() ran before there was a rootfs; give the new one its mount points and font stand-in.
+        proot.prepareRootfs()
     }
-
-    private fun extract(tarball: File) {
-        report(Stage.Extract, "Starting", 0f)
-        val root = proot.rootfs
-        LauncherData.deleteTree(root)
-        root.mkdirs()
-        // Nothing we recorded about the old rootfs holds for this one.
-        journal.reset()
-        provisioner.forgetAll()
-        val total = tarball.length()
-        val counter = CountingInputStream(tarball.inputStream())
-        TarArchiveInputStream(GZIPInputStream(BufferedInputStream(counter, 1 shl 16), 1 shl 16)).use { tar ->
-            var count = 0
-            while (true) {
-                val entry = tar.nextEntry ?: break
-                val name = entry.name.removePrefix("./").trimEnd('/')
-                if (name.isEmpty() || skipEntry(name)) continue
-                val file = File(root, name)
-                file.parentFile?.mkdirs()
-                when {
-                    entry.isDirectory -> file.mkdirs()
-                    entry.isSymbolicLink -> {
-                        file.delete()
-                        Os.symlink(entry.linkName, file.path)
-                    }
-                    // Hard links aren't allowed in app storage; copy the target instead.
-                    entry.isLink -> {
-                        val target = File(root, entry.linkName.removePrefix("./"))
-                        if (target.exists()) target.copyTo(file, overwrite = true)
-                    }
-                    entry.isFile -> file.outputStream().use { tar.copyTo(it) }
-                    else -> continue // device nodes, fifos
-                }
-                if (!entry.isSymbolicLink) runCatching { Os.chmod(file.path, entry.mode and 0x1ff or 0x180) }
-                if (++count % 500 == 0) {
-                    report(Stage.Extract, "$count files", counter.count.toFloat() / total)
-                }
-            }
-        }
-    }
-
-    private fun skipEntry(name: String) =
-        name == "boot" ||
-            name.startsWith("boot/") ||
-            name.startsWith("usr/lib/firmware/") ||
-            name.startsWith("usr/lib/modules/") ||
-            name.startsWith("dev/")
 
     private fun configure() {
         val root = proot.rootfs
@@ -519,19 +512,4 @@ class Bootstrap(
         val code = proot.run(script) { line -> if (log.add(line)) report(stage, step) }
         check(code == 0) { "`${script.take(60)}` failed (exit $code)" }
     }
-}
-
-private class CountingInputStream(
-    input: InputStream,
-) : FilterInputStream(input) {
-    var count = 0L
-        private set
-
-    override fun read(): Int = super.read().also { if (it >= 0) count++ }
-
-    override fun read(
-        b: ByteArray,
-        off: Int,
-        len: Int,
-    ): Int = super.read(b, off, len).also { if (it > 0) count += it }
 }

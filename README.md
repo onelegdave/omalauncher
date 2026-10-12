@@ -53,9 +53,18 @@ and Super+W (close) in Linux windows.
 ```sh
 ./scripts/fetch-proot.sh          # Termux's proot -> app/src/main/jniLibs (needs bsdtar)
 ./gradlew :app:installDebug
-# optional: skip the 830 MB download on the device
-adb push ArchLinuxARM-aarch64-latest.tar.gz /sdcard/Android/data/dev.omalauncher/files/
+# optional: skip the 830 MB download on the device; the signature is required
+curl -LO https://fl.us.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+curl -LO https://fl.us.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz.sig
+adb push ArchLinuxARM-aarch64-latest.tar.gz ArchLinuxARM-aarch64-latest.tar.gz.sig \
+  /sdcard/Android/data/dev.omalauncher/files/
 ```
+
+Setup checks the tarball against Arch Linux ARM's signing key, which the app
+carries, whether it was downloaded or pushed; a pushed tarball without its
+`.sig`, or with one that doesn't match, stops setup with a message saying so.
+Push both again, or delete the tarball there to have the app download one.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#installing-the-rootfs).
 
 Tests: `./gradlew :owl:test :app:testDebugUnitTest`. `./gradlew :owl:owlJar`
 builds `owl/build/cli/owl.jar`, the checker the widget store's CI runs.
@@ -77,6 +86,12 @@ In debug builds you can launch guest commands with
 - `store/`: Play listing sources (screenshot frames, privacy policy)
 - `fastlane/`: the Play listing and the upload lanes
 - `scripts/`: fetching proot and theme colors, rendering icons, screenshots and widget previews
+
+## AI assistance
+
+The signed rootfs download and the contained unpacking of the Linux system
+were designed and reviewed with OpenAI Codex, and implemented and reviewed
+with Claude Opus 5.5.
 
 ## License
 

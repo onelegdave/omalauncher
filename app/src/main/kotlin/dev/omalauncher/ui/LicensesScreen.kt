@@ -126,6 +126,13 @@ private val COMPONENTS =
                 "This product includes software developed at The Apache Software Foundation (https://www.apache.org/).",
             "https://commons.apache.org/proper/commons-compress/",
         ),
+        Component(
+            "Bouncy Castle",
+            "checks the signature of the Linux system it downloads",
+            "mit",
+            "Copyright (c) 2000-2026 The Legion of the Bouncy Castle Inc. (https://www.bouncycastle.org)",
+            "https://www.bouncycastle.org",
+        ),
         Component("AndroidSVG", "draws SVG icons", APACHE, "Copyright 2013 Paul LeBeau, Cave Rock Software Ltd.", "https://bigbadaboom.github.io/androidsvg/"),
         Component("ZXing", "draws the QR codes widgets are shared with", APACHE, "Copyright 2007-2025 ZXing authors", "https://github.com/zxing/zxing"),
         Component("JSON-java", "reads and writes JSON", "public-domain", "Public Domain.", "https://github.com/stleary/JSON-java"),

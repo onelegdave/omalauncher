@@ -8,6 +8,13 @@ Dates are when the build was uploaded to Play.
 
 - Apps from a work profile show up next to your own, marked with a briefcase,
   and dimmed while work apps are paused.
+- Setting up Linux checks Arch Linux ARM's signature on the system it
+  downloads (over HTTPS now) before unpacking it, and unpacks it into a
+  separate folder that only replaces an unfinished install once complete.
+  An interrupted download continues where it stopped. A tarball pushed with
+  adb needs its `.sig` file next to it.
+- Removing Linux that can't be completed says so on the Linux screen; if
+  nothing could be deleted, Linux stays installed instead of looking removed.
 
 ## 0.5.0 (versionCode 10) – 2026-10-11
 

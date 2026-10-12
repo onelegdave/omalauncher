@@ -34,6 +34,12 @@ android {
             useLegacyPackaging = true
             keepDebugSymbols += listOf("**/libproot.so", "**/libproot-loader.so")
         }
+        resources {
+            // Bouncy Castle's three jars each carry the same license text (it's also under settings › licenses).
+            pickFirsts += "META-INF/LICENSE.md"
+            // Only its lightweight API is used; nothing should find it as a security provider.
+            excludes += "META-INF/services/java.security.Provider"
+        }
     }
 
     // android.util.Log and friends are no-ops in JVM tests instead of throwing.
@@ -70,6 +76,8 @@ dependencies {
     implementation(libs.compose.foundation)
     implementation(libs.compose.ui)
     implementation(libs.commons.compress)
+    // Checks the rootfs tarball's OpenPGP signature (linux/RootfsSignature.kt); its lightweight API, no JCA provider.
+    implementation(libs.bouncycastle.pg)
     implementation(libs.androidsvg)
     implementation(libs.zxing.core)
     implementation(project(":owl"))

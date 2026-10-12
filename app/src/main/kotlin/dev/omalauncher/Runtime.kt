@@ -233,6 +233,11 @@ class Runtime(
                 audio.stop()
                 withContext(Dispatchers.IO) { proot.killAll() }
                 bootstrap.remove()
+                // Nothing was deleted (see Bootstrap.removalProblem): Linux runs again as it was.
+                if (bootstrap.isInstalled) {
+                    onLinuxReady()
+                    return@launch
+                }
                 withContext(Dispatchers.IO) {
                     updates.forget()
                     agents.load()

@@ -87,25 +87,30 @@ class Proot(
             dir.mkdirs()
         }
         // proot skips a bind whose host directory is missing, and the guest would then write into the rootfs.
-        // The empty mount points make the bound directories show up in listings of their parents.
-        for ((guest, host) in dataBinds) {
-            host.mkdirs()
-            if (rootfs.isDirectory) File(rootfs, guest.removePrefix("/")).mkdirs()
-        }
-        File(rootfs, "var/lib/pacman/db.lck").delete()
-        // An empty stand-in, so fontconfig lists the bound font when it reads the directory.
-        if (rootfs.isDirectory) {
-            val stub = File(rootfs, GUEST_CJK_FONT.removePrefix("/"))
-            if (cjkFont.isFile) {
-                stub.parentFile?.mkdirs()
-                stub.createNewFile()
-            } else {
-                stub.delete()
-            }
-        }
+        for ((_, host) in dataBinds) host.mkdirs()
+        prepareRootfs()
         for (sub in listOf("devices/system/cpu", "class", "block", "bus", "dev", "fs", "kernel")) File(sysDir, sub).mkdirs()
         val shim = context.assets.open("bwrap-shim.sh").use { it.readBytes() }
         if (!bwrapShim.isFile || !bwrapShim.readBytes().contentEquals(shim)) writeAtomically(bwrapShim, shim, executable = true)
+    }
+
+    /**
+     * The rootfs side of [prepare]; again after setup unpacked a new rootfs, which [prepare]
+     * found missing. Nothing here touches what guest processes use while they run.
+     */
+    fun prepareRootfs() {
+        if (!rootfs.isDirectory) return
+        // The empty mount points make the bound directories show up in listings of their parents.
+        for ((guest, _) in dataBinds) File(rootfs, guest.removePrefix("/")).mkdirs()
+        File(rootfs, "var/lib/pacman/db.lck").delete()
+        // An empty stand-in, so fontconfig lists the bound font when it reads the directory.
+        val stub = File(rootfs, GUEST_CJK_FONT.removePrefix("/"))
+        if (cjkFont.isFile) {
+            stub.parentFile?.mkdirs()
+            stub.createNewFile()
+        } else {
+            stub.delete()
+        }
     }
 
     private fun command(script: String): List<String> =

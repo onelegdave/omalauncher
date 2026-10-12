@@ -35,9 +35,19 @@ agent in the launcher, which is not affiliated with or endorsed by any of them.
 come from [Omarchy](https://github.com/omacom/omarchy), MIT, Copyright (c) David Heinemeier Hansson.
 Omalauncher is not affiliated with Omarchy.
 
+## Arch Linux ARM signing key
+
+`app/src/main/assets/archlinuxarm-build-system.gpg` is the public key of the
+Arch Linux ARM Build System (fingerprint `68B3537F39A313B3E574D06777193F152BDBE6A6`),
+exported from [archlinuxarm-keyring](https://github.com/archlinuxarm/archlinuxarm-keyring);
+the app uses it to check the rootfs it downloads. `app/src/test/resources/rootfs/`
+holds a detached signature Arch Linux ARM published with a rootfs release, as a
+test fixture. Both are public material from Arch Linux ARM.
+
 ## Bundled at build time
 
 `scripts/fetch-proot.sh` downloads pinned versions of Termux's builds of PRoot (GPL-2.0),
 talloc (LGPL-3.0) and libandroid-shmem (BSD-3-Clause); they are not in this
-repository. The app lists every component it ships, with its license, under
+repository. Gradle fetches the libraries, such as Bouncy Castle (MIT), which
+checks the rootfs signature. The app lists every component it ships, with its license, under
 settings › licenses (`ui/LicensesScreen.kt`, texts in `app/src/main/assets/licenses/`).

@@ -54,8 +54,13 @@ fun LinuxScreen(
     onDismiss: () -> Unit,
 ) {
     val state by runtime.bootstrap.state.collectAsState()
+    val removalProblem by runtime.bootstrap.removalProblem.collectAsState()
     OverlayPanel("linux", onDismiss, contentWidth = ReadingWidth) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 4.dp)) {
+            removalProblem?.let {
+                BasicText(it, style = Mono.copy(color = Palette.red, fontSize = TextSize.Small))
+                Spacer(Modifier.height(16.dp))
+            }
             when (val s = state) {
                 LinuxState.Checking -> {}
                 LinuxState.NotInstalled -> InstallOffer(runtime)
