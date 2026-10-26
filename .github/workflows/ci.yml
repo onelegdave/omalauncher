@@ -34,3 +34,15 @@ jobs:
       # Builds without proot (scripts/fetch-proot.sh), which is enough to compile wlbridge and run lint.
       - name: Build and lint
         run: ./gradlew :app:assembleDebug :app:lintDebug
+
+      # Manual verification also exercises the release shrinker and bundled proot.
+      # With no upload key, Gradle uses a debug key; nothing is published or uploaded.
+      - name: Prepare proot for release verification
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq libarchive-tools
+          scripts/fetch-proot.sh
+
+      - name: Verify minified release build
+        if: github.event_name == 'workflow_dispatch'
+        run: ./gradlew :app:assembleRelease
