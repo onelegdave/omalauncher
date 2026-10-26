@@ -1,16 +1,12 @@
 package dev.omalauncher.ui
 
-import android.content.Intent
-import android.net.Uri
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.BasicText
@@ -23,10 +19,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import dev.omalauncher.BuildConfig
+import dev.omalauncher.openUrl
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -46,18 +42,19 @@ private class Component(
 
 private const val APACHE = "apache-2.0"
 
-// The proot binaries are Termux's builds (scripts/fetch-proot.sh); libproot.so and libtalloc.so are
-// patched to need libtalloc.so instead of libtalloc.so.2, so the notice says so. The source links
-// name the versions that script pins; change them together.
+// proot is built from Termux's source with our patches (patches/proot), talloc and libandroid-shmem
+// are Termux's builds (scripts/fetch-proot.sh); libproot.so and libtalloc.so are patched to need
+// libtalloc.so instead of libtalloc.so.2, so the notice says so. The source links name the versions
+// that script pins; change them together.
 private val COMPONENTS =
     listOf(
         Component(
             "PRoot",
             "runs the optional Linux system",
             "gpl-2.0",
-            "Copyright (C) 2015 STMicroelectronics. Termux build of 5.1.107.96; the binary's libtalloc.so.2 dependency is renamed to libtalloc.so.",
+            "Copyright (C) 2015 STMicroelectronics. Built from Termux's 5.1.107.96 with omalauncher's patches; the binary's libtalloc.so.2 dependency is renamed to libtalloc.so.",
             "https://proot-me.github.io",
-            source = "https://github.com/termux/proot/tree/v5.1.107.96",
+            source = "https://github.com/SimonSchubert/omalauncher/tree/main/patches/proot",
         ),
         Component(
             "talloc",
@@ -74,6 +71,24 @@ private val COMPONENTS =
             "Copyright (c) 2013, Sergii Pylypenko\nCopyright (c) 2017, Fredrik Fornwall\nAll rights reserved.",
             "https://github.com/termux/libandroid-shmem",
             source = "https://github.com/termux/libandroid-shmem/tree/v0.7",
+        ),
+        Component(
+            "Mesa",
+            "OpenGL on Adreno GPUs in the optional Linux system",
+            "mit",
+            "Copyright (C) 1999-2007 Brian Paul and the Mesa contributors. Mesa 26.2.4 with omalauncher's " +
+                "zink patch. Most files are MIT; the rest are under the permissive licenses in Mesa's licenses/ directory.",
+            "https://mesa3d.org",
+            source = "https://github.com/SimonSchubert/omalauncher/tree/main/scripts/mesa",
+        ),
+        Component(
+            "wayland-protocols",
+            "protocol files bundled with Mesa",
+            "mit",
+            "Copyright © 2008-2013 Kristian Høgsberg\nCopyright © 2010-2013 Intel Corporation\n" +
+                "Copyright © 2013 Rafael Antognolli\nCopyright © 2013 Jasper St. Pierre\nCopyright © 2014 Jonas Ådahl\n" +
+                "Copyright © 2014 Jason Ekstrand\nCopyright © 2014-2015 Collabora, Ltd.\nCopyright © 2015 Red Hat Inc.",
+            "https://gitlab.freedesktop.org/wayland/wayland-protocols",
         ),
         Component(
             "Omarchy",
@@ -153,15 +168,10 @@ fun LicensesScreen(onDismiss: () -> Unit) {
             }
             items(COMPONENTS, key = { it.name }) { c ->
                 val expanded = open == c.name
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .clip(LauncherStyle.shape(12.dp))
-                        .background(Palette.surface)
-                        .clickable { open = if (expanded) null else c.name }
-                        .padding(14.dp),
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                // Only its header opens and closes it: keys go from there into what it shows, which a tap target around
+                // it all would keep them out of.
+                Column(Modifier.card()) {
+                    Row(Modifier.clickable { open = if (expanded) null else c.name }, verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             BasicText(c.name, style = Mono.copy(fontSize = TextSize.Item))
                             BasicText("${c.license} · ${c.use}", style = Mono.copy(color = Palette.muted, fontSize = TextSize.Small))
@@ -191,8 +201,7 @@ private fun Details(c: Component) {
         if (c.license == "lgpl-3.0") value = withContext(Dispatchers.IO) { context.assets.open("licenses/gpl-3.0.txt").bufferedReader().use { it.readText() } }
     }
     val small = Mono.copy(fontSize = TextSize.Small)
-    // runCatching: there may be no browser.
-    val open = remember(context) { { url: String -> runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }; Unit } }
+    val open = remember(context) { { url: String -> context.openUrl(url); Unit } }
     Spacer(Modifier.height(10.dp))
     BasicText(c.notice, style = small)
     Spacer(Modifier.height(10.dp))
@@ -202,10 +211,10 @@ private fun Details(c: Component) {
     }
     text?.let {
         Spacer(Modifier.height(10.dp))
-        BasicText(it, style = small.copy(color = Palette.muted))
+        BasicText(it, Modifier.keyScrolled(around = true), style = small.copy(color = Palette.muted))
     }
     gpl3?.let {
         Spacer(Modifier.height(10.dp))
-        BasicText(it, style = small.copy(color = Palette.muted))
+        BasicText(it, Modifier.keyScrolled(around = true), style = small.copy(color = Palette.muted))
     }
 }

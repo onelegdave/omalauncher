@@ -34,7 +34,7 @@ class Proot(
     val procShim = ProcShim(File(filesDir, "proc"))
 
     /** How guest apps render OpenGL and Vulkan: in software, or on the GPU once [Gpu] turns it on. */
-    @Volatile var graphicsEnv: List<String> = Gpu.SOFTWARE_ENV
+    @Volatile var graphicsEnv: List<String> = SOFTWARE_ENV
 
     /** Replaces /usr/bin/bwrap in the guest, see assets/bwrap-shim.sh. */
     private val bwrapShim = File(filesDir, "bwrap-shim")
@@ -44,6 +44,8 @@ class Proot(
         listOf(
             "$GUEST_HOME/.local/share/omarchy" to LauncherData.omarchyDir(context),
             "$GUEST_HOME/.config/omalauncher/widgets" to LauncherData.widgetsDir(context),
+            "$GUEST_HOME/.config/omalauncher/style" to LauncherData.styleDir(context),
+            "$GUEST_HOME/.config/omalauncher/home" to LauncherData.homeDir(context),
             "$GUEST_HOME/.config/omarchy/themes" to LauncherData.userThemesDir(context),
             "$GUEST_HOME/.config/omarchy/backgrounds" to LauncherData.userBackgroundsDir(context),
         )
@@ -67,6 +69,22 @@ class Proot(
         }
         return File(rootfs, guestPath.removePrefix("/"))
     }
+
+    /** Where the guest can see: the rootfs and the binds, as real paths. */
+    private val visible by lazy { (listOf(rootfs) + binds.map { it.second }).map { it.canonicalFile } }
+
+    /** Whether [real], a canonical host file, is one the guest can see, rather than the launcher's own. */
+    fun guestVisible(real: File) = visible.any { real.startsWith(it) }
+
+    /** The guest's files as it sees them; see [GuestFs]. */
+    val guestFs by lazy { GuestFs(::hostFile, ::guestVisible) }
+
+    /**
+     * Where a guest path that Linux or a widget names is on the Android side, as the guest sees it:
+     * `..` stops at /, links are followed inside the guest. Null for a link in a loop or out of the
+     * guest, so no path reaches the launcher's own files ([hostFile] is for paths of our own).
+     */
+    fun guestFile(guestPath: String): File? = runCatching { guestFs.host(guestPath) }.getOrNull()
 
     /** The guest path of a host file, the reverse of [hostFile]; null if the guest can't see it. */
     fun guestPath(host: File): String? {
@@ -154,8 +172,9 @@ class Proot(
                 "OPENCODE_DISABLE_AUTOUPDATE=1",
                 "GROK_DISABLE_AUTOUPDATER=1",
                 "BROWSER=xdg-open",
-                // micro takes taps and scrolling; yazi and git open files with it.
-                "EDITOR=micro",
+                // The launcher's editor; yazi and git open files with it. Its shim falls back to micro.
+                "EDITOR=$EDIT_COMMAND",
+                "VISUAL=$EDIT_COMMAND",
                 "XDG_RUNTIME_DIR=$GUEST_RUNTIME_DIR",
                 "WAYLAND_DISPLAY=${waylandSocket.name}",
                 "XDG_SESSION_TYPE=wayland",

@@ -21,7 +21,12 @@ interface Host {
 
     /**
      * The tile's size: cols and rows in grid cells, tileWidth and tileHeight in dp; null until it's laid out.
-     * Also screenWidth and screenHeight (its screen's size), and linux: whether Linux is installed and running.
+     * Also screenWidth and screenHeight (its screen's size), screenInset (how much of its bottom the
+     * navigation bar covers, for an app with `edge` and a face, or the keyboard while a face's field has it), screenTop (how
+     * much of an app's top a camera cutout covers, with `statusBar: false`), linux: whether Linux is installed and running,
+     * corners: the launcher's corner style as a radius scale, 0 (edge), 0.5 (soft) or 1 (round), and gapsIn, gapsOut and
+     * borderWidth: its widgets' gaps and border width in dp, in a keybar the extra keys' own gapsOut and borderWidth, and
+     * tileOpacity and tileFrost: how much its widgets cover the wallpaper, 0 to 1, and how much they blur it in dp, 0 without frost.
      */
     fun tile(name: String): Value = Null
 
@@ -34,6 +39,25 @@ interface Host {
     fun runInto(
         command: String,
         slot: Int,
+    ) {}
+
+    /** `s = shortcuts(key)` in a handler: the app's shortcuts, as its long-press menu offers them, go into [slot] when they've loaded. */
+    fun shortcutsInto(
+        key: String,
+        slot: Int,
+    ) {}
+
+    /**
+     * `post(url, body, headers)` in a handler: an HTTP POST, with a map or list [body] sent as JSON. With a
+     * [slot] (`x = post(...)`), the answer goes there as `{code, ok, out}` when it arrives. [method] is
+     * POST, or `method:`'s PUT, PATCH or DELETE.
+     */
+    fun post(
+        url: String,
+        body: Value,
+        headers: Map<String, String>,
+        slot: Int?,
+        method: String,
     ) {}
 
     val budget: Budget
@@ -53,6 +77,19 @@ class Budget(
         if (depth++ == 0) steps = 0
         try {
             return block()
+        } finally {
+            depth--
+        }
+    }
+
+    /** run { ev(env) } without a closure: it wraps every binding read and Canvas argument, per frame. */
+    fun eval(
+        ev: Ev,
+        env: Env,
+    ): Value {
+        if (depth++ == 0) steps = 0
+        try {
+            return ev(env)
         } finally {
             depth--
         }
@@ -115,6 +152,8 @@ class Ev internal constructor(
      * boxing saved in a Canvas that draws a value still loading every frame.
      */
     internal val fast: Fast?,
+    /** What [invoke] falls back to when [fast] gives NaN; [num] goes straight to it rather than through [fast] again. */
+    private val slow: Ev? = null,
 ) {
     constructor(const: Value?, f: (Env) -> Value) : this(const, f, null)
 
@@ -128,6 +167,7 @@ class Ev internal constructor(
         if (fast != null) {
             val d = fast.of(env)
             if (!d.isNaN()) return d
+            if (slow != null) return slow(env).let { if (it is Num) it.v else it.num() ?: default }
         }
         val v = invoke(env)
         return if (v is Num) v.v else v.num() ?: default
@@ -230,6 +270,8 @@ sealed interface Global {
         val init: Ev,
         /** Saved across restarts. */
         val persist: Boolean = false,
+        /** `secret`: saved across restarts encrypted, apart from [persist]'s values; it only goes into requests. */
+        val secret: Boolean = false,
     ) : Global
 
     class Let(
@@ -259,12 +301,29 @@ sealed interface Global {
  * is live, `at` when the clock reaches a Unix time, `when` each time a
  * condition turns true, `on` each time a value changes (with `value` and `old`).
  */
+/** What a trigger reacts to, by the word that starts it. */
+enum class TriggerKind(
+    val word: String,
+) {
+    EVERY("every"),
+    AT("at"),
+    WHEN("when"),
+    ON("on"),
+    ;
+
+    companion object {
+        fun of(word: String) = entries.first { it.word == word }
+    }
+}
+
 class Trigger(
-    val kind: String,
+    val kind: TriggerKind,
     /** The condition, time or value; for `every`, the interval in seconds. */
     val expr: Ev,
     val action: Action,
     val pos: Int,
+    /** `on x first`: also for x's first value, with `old` null. */
+    val first: Boolean = false,
 )
 
 class Program(
@@ -272,22 +331,42 @@ class Program(
     val meta: Map<String, Value>,
     /** The owl language version it needs; see [Compiler.LEVEL]. */
     val level: Int,
-    val size: Pair<Int, Int>?,
-    val minSize: Pair<Int, Int>,
-    val page: Int,
-    val order: Int,
+    /** The tile's: an app has none of these. */
+    val size: Pair<Int, Int>? = null,
+    val minSize: Pair<Int, Int> = 1 to 1,
+    /** A face's or an app's `statusBar`: while false, the status bar hides as it shows; null keeps it. */
+    val statusBar: Ev? = null,
+    val page: Int = 1,
+    val order: Int = 0,
     /** Tile padding in dp, and an optional tile background. */
-    val padding: Double,
-    val background: Ev?,
+    val padding: Double = 12.0,
+    val background: Ev? = null,
     val globals: List<Global>,
-    val root: List<WNode>,
+    val root: List<WNode> = emptyList(),
     /** The screen { } block: a full-screen view over the same globals, opened with screen(). */
     val screen: List<WNode>? = null,
     val screenTitle: Ev? = null,
-    val onTap: Action?,
+    /** An app's `back`: while true, the frame shows a back chevron and Back runs [onBack] instead of closing it. */
+    val back: Ev? = null,
+    val onBack: Action? = null,
+    /** An app's `edge`: its view runs on under the navigation bar, which `screenInset` measures. A face's: its nodes run on under the status bar and a camera cutout, which `screenTop`, `screenLeft` and `screenRight` measure. */
+    val edge: Boolean = false,
+    /** A panel's `onSubmit`: Enter in the prompt bar while it's open, with what's typed as `value`. */
+    val onSubmit: Action? = null,
+    /** A panel's `onKey`: up, down, tab or shift-tab pressed in the prompt bar while it's open, as `value`. */
+    val onKey: Action? = null,
+    /** A panel's `enter`: what the prompt bar says Enter does while it's open, like "▸ open". */
+    val enter: Ev? = null,
+    /** A panel's `opacity`: how much the backdrop the launcher draws behind it covers home, 0 to 1; null for the default. */
+    val opacity: Ev? = null,
+    /** A panel's `keyboard`: whether the keyboard comes up as it opens above the prompt bar; false leaves it down until the bar is tapped. */
+    val keyboard: Boolean = true,
+    val onTap: Action? = null,
     val triggers: List<Trigger>,
     /** Shell commands this widget can run, known without running it; for reviewing shared widgets. */
     val commands: List<String>,
+    /** Each `secret` state's servers, sorted: its sealed value is kept only while these stay the same. */
+    val secretHosts: Map<String, List<String>> = emptyMap(),
     /** Declared dependencies: package manager -> package names, e.g. pacman -> [jq, curl]. */
     val requires: Map<String, List<String>>,
     /**
@@ -303,4 +382,21 @@ class Program(
     /** Has a Terminal node. */
     val terminal: Boolean = false,
     val nodeCount: Int,
-)
+    /** A tile or an app; for an app [screen] is the whole view and [root] is empty. */
+    val kind: OwlKind = OwlKind.Widget,
+    /** An app's icon for the drawer and home, when `icon:` holds an SVG. */
+    val icon: String? = null,
+    /** An app's icon, when `icon:` names an `asset` (a PNG or other image) instead. */
+    val iconImage: ByteArray? = null,
+    /** What compiles but is likely wrong, one line each with its line:col, for owl-check: a URL value not put through enc(). */
+    val warnings: List<String> = emptyList(),
+) {
+    /** [icon] or [iconImage] as a cache key, hashed once: the launcher looks icons up on every recomposition. */
+    val iconKey: String? by lazy { icon ?: iconImage?.let { "image:" + it.contentHashCode() } }
+
+    /** A face (`face "…" { }`): it is its home page, the whole screen with no frame, and nothing else goes on it. */
+    val isFace get() = kind == OwlKind.Face
+
+    /** The bytes of the `asset` named [name], if there is one. */
+    fun asset(name: String): ByteArray? = (globals.firstOrNull { it.name == name } as? Global.Asset)?.bytes
+}

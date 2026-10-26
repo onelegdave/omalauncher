@@ -17,6 +17,38 @@ import java.nio.file.Files
 import java.util.concurrent.CancellationException
 
 class RootfsInstallerTest {
+    @Test fun insufficientSpaceBeforeExtractionKeepsTheVerifiedCacheAndOldRootfs() {
+        rootfs.mkdirs()
+        val old = File(rootfs, "old").apply { writeText("kept") }
+        val m = mirror()
+        val noSpace = java.io.IOException("ENOSPC")
+        val installer = RootfsInstaller(
+            files, { false }, { forgets++ }, LauncherData::deleteTree,
+            beforeExtract = { throw noSpace },
+        )
+        assertTrue(assertThrows(java.io.IOException::class.java) { installer.install(source(m), extractor()) } === noSpace)
+        assertEquals("kept", old.readText())
+        assertTrue(File(cache, ROOTFS_TARBALL).exists())
+        assertFalse(installer.activated())
+        assertEquals(0, forgets)
+    }
+
+    @Test fun cancellationBetweenExtractionAndActivationKeepsTheOldRootfs() {
+        rootfs.mkdirs()
+        val old = File(rootfs, "old").apply { writeText("kept") }
+        val installer = installer
+        var checks = 0
+        assertThrows(CancellationException::class.java) {
+            installer.install(source(mirror()), extractor()) {
+                if (++checks == 3) throw CancellationException("stop before activation")
+            }
+        }
+        assertEquals("kept", old.readText())
+        assertFalse(installer.staging.exists())
+        assertFalse(installer.activated())
+        assertEquals(0, forgets)
+    }
+
     @get:Rule val tmp = TemporaryFolder()
 
     private val signer = TestSigner.trusted

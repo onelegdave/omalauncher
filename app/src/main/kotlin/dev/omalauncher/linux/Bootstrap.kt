@@ -1,9 +1,13 @@
 package dev.omalauncher.linux
 
 import android.content.Context
+import android.system.ErrnoException
 import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import dev.omalauncher.LauncherData
+import dev.omalauncher.hex
+import dev.omalauncher.openHttp
 import dev.omalauncher.upgrade.Provisioner
 import dev.omalauncher.upgrade.StepJournal
 import dev.omalauncher.upgrade.writeAtomically
@@ -18,12 +22,39 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.net.URL
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.security.DigestInputStream
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 private const val TAG = "bootstrap"
 
 /** Attempts per network step before setup (or an update) reports a failure. */
 private const val NETWORK_TRIES = 3
+
+/** How long `echo | cat` may take in the guest before setup calls the phone's kernel broken; it takes well under a second. */
+private const val FORK_CHECK_SECONDS = 30L
+
+/** Room for the download (~830 MB). */
+private const val TARBALL_SPACE = 900_000_000L
+
+/** Room for the unpacked system and what setup installs into it (~1.9 GB with an agent), with some to spare. */
+private const val SYSTEM_SPACE = 2_100_000_000L
+
+/** A failure that trying again can't fix, like a full disk: a network step stops at once rather than downloading again. */
+private class NoRetry(
+    message: String,
+    cause: Throwable? = null,
+) : IOException(message, cause)
+
+private fun Throwable.outOfSpace() =
+    generateSequence(this) { it.cause }.any {
+        (it is ErrnoException && it.errno == OsConstants.ENOSPC) || it.message?.contains("ENOSPC") == true
+    }
+
+private fun gigabytes(bytes: Long) = "%.1f GB".format(bytes / 1e9)
 
 /**
  * Omarchy's classic terminal apps. The Nerd Font glyphs come from the
@@ -33,13 +64,14 @@ private const val NETWORK_TRIES = 3
 private val PACKAGES =
     listOf(
         "foot", "ttf-dejavu", "btop", "fastfetch", "ttf-jetbrains-mono", "ttf-nerd-fonts-symbols-mono",
-        "neovim", "lazygit", "starship", "eza", "bat", "fd", "ripgrep", "fzf", "zoxide", "tmux", "gum", "jq", "tealdeer",
+        "neovim", "starship", "eza", "bat", "fd", "ripgrep", "fzf", "zoxide", "tmux", "gum", "jq", "tealdeer",
         "man-db", "less", "dua-cli", "inxi", "whois", "git", "bash-completion", "pulseaudio", "pulseaudio-alsa", "micro",
     )
 
 /** Omarchy's Winamp-style player; not in Arch's ARM repos, but upstream ships an arm64 build. */
 private const val CLIAMP_VERSION = "v2.3.0"
 private const val CLIAMP_URL = "https://github.com/bjarneo/cliamp/releases/download/$CLIAMP_VERSION/cliamp-linux-arm64"
+private const val CLIAMP_SHA256 = "827b4aa879feecab33ea621dc1460c60ffa765c210b5046d679ce5a4073d2b32"
 
 private val MIRRORS =
     listOf(
@@ -152,6 +184,27 @@ class Bootstrap(
     /** One of [run], [install] and [remove] at a time: none may see another's half-done state. */
     private val lifecycle = Mutex()
 
+    @Volatile private var cancelled = false
+    @Volatile private var rootfsDownload: RootfsDownloader? = null
+    @Volatile private var connection: HttpURLConnection? = null
+
+    /** Only an unfinished install may be cancelled; updates must preserve the installed system. */
+    val cancellable get() = !setUp && !cancelled
+
+    /** The caller also cancels/joins its coroutine and stops guest commands before [remove]. */
+    fun cancel(): Boolean {
+        if (!cancellable) return false
+        cancelled = true
+        rootfsDownload?.cancel()
+        // Some HttpURLConnection implementations wait for a read lock in disconnect; never block the UI thread.
+        connection?.let { conn -> thread(name = "bootstrap-cancel", isDaemon = true) { runCatching { conn.disconnect() } } }
+        return true
+    }
+
+    private fun checkCancelled() {
+        if (cancelled) throw CancellationException("cancelled")
+    }
+
     private val rootfsInstaller =
         RootfsInstaller(
             proot.filesDir,
@@ -161,6 +214,7 @@ class Bootstrap(
                 provisioner.forgetAll()
             },
             deleteTree = LauncherData::deleteTree,
+            beforeExtract = { requireSpace(SYSTEM_SPACE) },
             report = ::report,
         )
 
@@ -183,6 +237,10 @@ class Bootstrap(
         listOf(
             Step("rootfs", Stage.Download, "Downloading Arch Linux ARM", network = true) { installRootfs() },
             Step("etc-2", Stage.Configure, "Configuring the system", network = false) { configure() },
+            // Only before the first setup: a phone where Linux already runs can fork.
+            Step("forks-1", Stage.Configure, "Checking that programs can start", network = false, isDone = { journal.setupComplete }) {
+                checkForks()
+            },
             Step("keyring-1", Stage.Configure, "Initializing pacman keyring", network = false) {
                 guest("pacman-key --init && pacman-key --populate archlinuxarm")
             },
@@ -206,23 +264,23 @@ class Bootstrap(
     private suspend fun Step.attempt() {
         repeat(if (network) NETWORK_TRIES - 1 else 0) { n ->
             try {
+                checkCancelled()
                 return run()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 if (e is RootfsException && !e.kind.retryable) throw e
+                if (e is NoRetry) throw e
+                if (e.outOfSpace()) throw outOfSpace(e)
                 log.add("${e.message}; trying again (${n + 2} of $NETWORK_TRIES)")
                 kotlinx.coroutines.delay(5_000L * (n + 1))
             }
         }
+        checkCancelled()
         run()
     }
 
-    /**
-     * Launchers before the step journal marked a finished setup with files/rootfs-ready
-     * (and the app packages with apps-vN). Such a system is set up: record what those
-     * builds did, so only newer steps run. Never let it look like a fresh install.
-     */
+    /** Adopt the pre-journal ready marker without ever replacing that completed system. */
     private fun adoptLegacySetup() {
         val ready = File(proot.filesDir, "rootfs-ready")
         if (journal.setupComplete || !ready.exists()) return
@@ -253,7 +311,13 @@ class Bootstrap(
                 else -> setup()
             }
             _state.value = LinuxState.Installed
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // Runtime waits for this work, then removes the unfinished install under the same lifecycle lock.
+            if (cancelled) {
+                Log.i(TAG, "setup cancelled")
+                return
+            }
+            if (e is CancellationException) throw e
             Log.e(TAG, "setup failed", e)
             _state.value = LinuxState.Failed(stage, e.message ?: e.toString(), log.toList())
         }
@@ -337,6 +401,7 @@ class Bootstrap(
                         "They're deleted when the launcher next starts, or before Linux is installed again."
                 }
                 _state.value = LinuxState.NotInstalled
+                cancelled = false
             }
         }
 
@@ -348,16 +413,19 @@ class Bootstrap(
     private suspend fun setup() {
         for (step in steps) {
             if (step.done()) continue
+            checkCancelled()
             report(step.stage, step.label)
             try {
                 step.attempt()
+                checkCancelled()
                 journal.mark(step.id)
             } catch (e: Exception) {
-                if (!step.optional) throw e
+                if (!step.optional || e is CancellationException) throw e
                 log.add("${step.label} failed: ${e.message}; retry in settings")
             }
         }
         installAgents()
+        checkCancelled()
         journal.completeSetup()
     }
 
@@ -401,7 +469,7 @@ class Bootstrap(
                     // Package steps run pacman; nothing else may hold its lock meanwhile.
                     pacman.lock.withLock { step.attempt() }
                     journal.mark(step.id)
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     Log.w(TAG, "update step ${step.id} failed", e)
                     _updates.value = JobState.Failed(log.toList().takeLast(12) + (e.message ?: e.toString()))
                     return@withContext
@@ -418,6 +486,7 @@ class Bootstrap(
         val chosen = chosenAgents
         for (agent in chosen) {
             if (agents.isInstalled(agent)) continue
+            checkCancelled()
             try {
                 report(Stage.Agents, "Installing ${agent.name}")
                 guest(agents.installScript(agent))
@@ -448,7 +517,10 @@ class Bootstrap(
      */
     private suspend fun installRootfs() {
         val job = currentCoroutineContext()[Job]
-        val ensureActive = { job?.ensureActive() ?: Unit }
+        val ensureActive = {
+            checkCancelled()
+            job?.ensureActive() ?: Unit
+        }
         val downloader =
             RootfsDownloader(context.cacheDir, ensureActive = ensureActive) { done, total ->
                 report(
@@ -457,20 +529,44 @@ class Bootstrap(
                     if (total > 0) done.toFloat() / total else null,
                 )
             }
-        val verifier = RootfsVerifier(context.assets.open(ROOTFS_SIGNER_ASSET).use { it.readBytes() })
-        val source = RootfsSource(context.cacheDir, context.getExternalFilesDir(null), verifier, downloader, ensureActive = ensureActive) { step, progress ->
-            report(Stage.Download, step, progress)
+        rootfsDownload = downloader
+        try {
+            ensureActive()
+            val verifier = RootfsVerifier(context.assets.open(ROOTFS_SIGNER_ASSET).use { it.readBytes() })
+            val source =
+                RootfsSource(
+                    context.cacheDir, context.getExternalFilesDir(null), verifier, downloader,
+                    ensureActive = ensureActive,
+                    beforeDownload = { requireSpace((TARBALL_SPACE - downloader.partialBytes).coerceAtLeast(0L) + SYSTEM_SPACE) },
+                    beforeCopy = { bytes -> requireSpace(bytes + SYSTEM_SPACE) },
+                ) { step, progress ->
+                    report(Stage.Download, step, progress)
+                }
+            val extractor =
+                RootfsExtractor(
+                    symlink = { target, path -> Os.symlink(target, path) },
+                    ensureActive = ensureActive,
+                    progress = { count, fraction -> report(Stage.Extract, "$count files", fraction) },
+                )
+            rootfsInstaller.install(source, extractor, ensureActive)
+            // Proot.prepare() ran before there was a rootfs; give the new one its mount points and font stand-in.
+            proot.prepareRootfs()
+        } catch (e: Exception) {
+            throw if (e.outOfSpace()) outOfSpace(e) else e
+        } finally {
+            rootfsDownload = null
         }
-        val extractor =
-            RootfsExtractor(
-                symlink = { target, path -> Os.symlink(target, path) },
-                ensureActive = ensureActive,
-                progress = { count, fraction -> report(Stage.Extract, "$count files", fraction) },
-            )
-        rootfsInstaller.install(source, extractor)
-        // Proot.prepare() ran before there was a rootfs; give the new one its mount points and font stand-in.
-        proot.prepareRootfs()
     }
+
+    private fun requireSpace(bytes: Long) {
+        val free = proot.filesDir.usableSpace
+        if (free < bytes) {
+            throw NoRetry("not enough space: Linux needs ${gigabytes(bytes)} free, the phone has ${gigabytes(free)}; free some up, then try again")
+        }
+    }
+
+    private fun outOfSpace(e: Exception) =
+        NoRetry("the phone ran out of space; Linux needs about ${gigabytes(TARBALL_SPACE + SYSTEM_SPACE)} free; free some up, then try again", e)
 
     private fun configure() {
         val root = proot.rootfs
@@ -502,9 +598,74 @@ class Bootstrap(
         writeAtomically(proot.keymap, proot.hostFile("/tmp/keymap.xkb").readBytes() + 0)
     }
 
+    /**
+     * Streamed to disk and hashed on the way: the binary is ~36 MB, and holding it while a buffer
+     * doubles needs more heap than small phones give an app (48 MB on a 2 GB Android 10 device).
+     */
     private fun installCliamp() {
-        val bytes = URL(CLIAMP_URL).openStream().use { it.readBytes() }
-        writeAtomically(File(proot.rootfs, "usr/local/bin/cliamp"), bytes, executable = true)
+        val target = File(proot.rootfs, "usr/local/bin/cliamp")
+        val tmp = File(target.parentFile, ".cliamp.download")
+        val digest = MessageDigest.getInstance("SHA-256")
+        // Runs under pacman's lock, so a stalled download must time out rather than hold it.
+        val conn = openHttp(CLIAMP_URL, connectTimeout = 10_000, readTimeout = 20_000)
+        connection = conn
+        try {
+            checkCancelled()
+            conn.useCaches = false
+            if (conn.responseCode != 200) throw IOException("HTTP ${conn.responseCode} for $CLIAMP_URL")
+            target.parentFile?.mkdirs()
+            DigestInputStream(conn.inputStream, digest).use { input ->
+                tmp.outputStream().use { out ->
+                    val buffer = ByteArray(1 shl 16)
+                    while (true) {
+                        checkCancelled()
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        out.write(buffer, 0, count)
+                    }
+                    out.fd.sync()
+                }
+            }
+        } finally {
+            connection = null
+            conn.disconnect()
+        }
+        checkCancelled()
+        if (digest.digest().hex() != CLIAMP_SHA256) {
+            tmp.delete()
+            error("cliamp download doesn't match $CLIAMP_VERSION")
+        }
+        tmp.setExecutable(true, false)
+        // One rename, so a running cliamp is never replaced by half a file.
+        if (!tmp.renameTo(target)) {
+            tmp.delete()
+            error("can't replace $target")
+        }
+    }
+
+    /**
+     * Runs a pipeline, the smallest guest command that forks. Some custom ROM kernels (4.14, with Android's cgroup v2
+     * freezer backported but not its follow-up, upstream 05b289263772) make every fork of a traced process restart
+     * forever (#105), and the next step, pacman-key, would hang without a word. Such a phone gets an error naming the cause.
+     */
+    private fun checkForks() {
+        val process = proot.process("echo forks | cat").start()
+        val output = StringBuffer()
+        val reader = thread(isDaemon = true) { runCatching { process.inputStream.bufferedReader().forEachLine { output.appendLine(it) } } }
+        if (process.waitFor(FORK_CHECK_SECONDS, TimeUnit.SECONDS)) {
+            reader.join(1_000)
+            output.lines().forEach(log::add)
+            check(process.exitValue() == 0 && "forks" in output) { "Linux can't run commands here (exit ${process.exitValue()})" }
+            return
+        }
+        process.destroyForcibly()
+        // The guest shell is proot's tracee and outlives a killed proot.
+        proot.killAll()
+        log.add("a guest command that starts another one didn't finish in $FORK_CHECK_SECONDS s (kernel ${System.getProperty("os.version")})")
+        error(
+            "this phone's kernel stops Linux programs from starting other programs, so setup can't go on. " +
+                "custom ROMs with a 4.14 kernel need kernel commit 05b289263772 from their maintainer; see github issue #105",
+        )
     }
 
     private fun guest(script: String) {

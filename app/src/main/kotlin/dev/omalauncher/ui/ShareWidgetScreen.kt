@@ -8,7 +8,6 @@ import android.graphics.Bitmap
 import android.net.Uri
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,6 +27,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -46,6 +47,7 @@ import com.google.zxing.common.BitMatrix
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import dev.omalauncher.BuildConfig
+import dev.omalauncher.openUrl
 import dev.omalauncher.widgets.Market
 import dev.omalauncher.widgets.WidgetSpec
 import dev.omalauncher.widgets.market.Catalog
@@ -91,6 +93,8 @@ fun ShareWidgetScreen(
     var copied by remember(file) { mutableStateOf(false) }
     var showSource by remember(file) { mutableStateOf(false) }
 
+    // Keys on get QR code go on to share it, which takes its place once it's uploaded.
+    val shareCode = remember { FocusRequester() }
     OverlayPanel("share $name", onDismiss, contentWidth = ReadingWidth) {
         val prepared = prepared ?: return@OverlayPanel
         val text = prepared.text
@@ -102,14 +106,10 @@ fun ShareWidgetScreen(
                 FlowRow {
                     BracketAction(if (showSource) "hide the file" else "show the whole file", Palette.accent) { showSource = !showSource }
                     // The agent's check comes with your own look, not in place of it.
-                    if (showSource) BracketAction("check for secrets with agent", Palette.accent, onCheck)
+                    if (showSource) BracketAction("check for secrets with agent", Palette.accent, onClick = onCheck)
                 }
                 if (showSource) {
-                    BasicText(
-                        text,
-                        Modifier.fillMaxWidth().background(Palette.surface).horizontalScroll(rememberScrollState()).padding(6.dp),
-                        style = Mono.copy(fontSize = TextSize.Small),
-                    )
+                    CodeBlock(text)
                 }
             }
             when {
@@ -133,7 +133,7 @@ fun ShareWidgetScreen(
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                     verticalArrangement = Arrangement.spacedBy(2.dp),
                                 ) {
-                                    BracketAction(if (uploading) "uploading…" else "get QR code", Palette.accent) {
+                                    BracketAction(if (uploading) "uploading…" else "get QR code", Palette.accent, Modifier.passesKeys(shareCode)) {
                                         if (uploading) return@BracketAction
                                         uploading = true
                                         uploadError = null
@@ -152,10 +152,13 @@ fun ShareWidgetScreen(
                             }
                         }
                     }
+                    val sendable = link.length <= MAX_SENT_LINK
                     BasicText(
                         when {
-                            code == null -> "Or send the link: permanent, the whole widget is in it."
-                            pasted != null -> "Links to ${Paste.HOST}, gone in ${Paste.DAYS} days. The link below is permanent."
+                            code == null && sendable -> "Or send the link: permanent, the whole widget is in it."
+                            code == null -> "Too big to send as a link: the QR code is the way to share it."
+                            pasted != null && sendable -> "Links to ${Paste.HOST}, gone in ${Paste.DAYS} days. The link below is permanent."
+                            pasted != null -> "Links to ${Paste.HOST}, gone in ${Paste.DAYS} days."
                             else -> "Permanent: the whole widget is in the image."
                         },
                         style = Mono.copy(color = Palette.muted, fontSize = TextSize.Small),
@@ -163,7 +166,7 @@ fun ShareWidgetScreen(
                     )
                     FlowRow {
                         if (code != null) {
-                            BracketAction("share QR code", Palette.accent) {
+                            BracketAction("share QR code", Palette.accent, Modifier.focusRequester(shareCode)) {
                                 scope.launch {
                                     val uri = withContext(Dispatchers.IO) { qrImage(context, code, Submit.slug(name)) }
                                     val send =
@@ -178,16 +181,16 @@ fun ShareWidgetScreen(
                                 }
                             }
                         }
-                        BracketAction("share link", Palette.accent) {
+                        if (sendable) BracketAction("share link", Palette.accent) {
                             val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, link).putExtra(Intent.EXTRA_SUBJECT, "$name widget")
                             context.startActivity(Intent.createChooser(send, "Share $name").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                         }
-                        BracketAction(if (copied) "copied" else "copy link", Palette.foreground) {
+                        if (sendable) BracketAction(if (copied) "copied" else "copy link", Palette.foreground) {
                             context.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("$name widget", link))
                             copied = true
                         }
                     }
-                    BasicText(
+                    if (sendable) BasicText(
                         "Omarchy: omarchy-widgets import '<link>'",
                         style = Mono.copy(color = Palette.muted, fontSize = TextSize.Small),
                     )
@@ -196,18 +199,24 @@ fun ShareWidgetScreen(
 
             if (onPublish != null) {
                 Spacer(Modifier.height(16.dp))
-                BasicText("in the widget store", style = Mono.copy(color = Palette.accent, fontSize = TextSize.Title))
+                BasicText("in the store", style = Mono.copy(color = Palette.accent, fontSize = TextSize.Title))
                 BasicText(
                     "An issue on github.com/${Market.REPO}; once reviewed, anyone can install it.",
                     style = Mono.copy(color = Palette.muted, fontSize = TextSize.Small),
                 )
                 if (text != null) StoreIssue(spec, text)
                 BasicText("Or a pull request from your agent, which can add a preview too:", style = Mono.copy(color = Palette.muted, fontSize = TextSize.Small))
-                BracketAction("create pull request with agent", Palette.accent, onPublish)
+                BracketAction("create pull request with agent", Palette.accent, onClick = onPublish)
             }
         }
     }
 }
+
+/**
+ * The longest whole-widget link the share sheet and the clipboard get: both go through a binder transaction, which
+ * fails past about 1 MB (two bytes a character), and a widget near [Review.MAX_BYTES] makes a link of ~400K.
+ */
+private const val MAX_SENT_LINK = 100_000
 
 /** What the share screen shows, worked out off the main thread; nulls past the first that can't be had. */
 private class Prepared(
@@ -240,9 +249,11 @@ private fun StoreIssue(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    // The folder is the maintainer's to pick; only the rest of the review applies.
+    // The folder is the maintainer's to pick; only the rest of the review applies. Under the kind's own folder, or a face
+    // or an app is turned down for being one.
     val review by produceState<Review?>(null, text) {
-        value = withContext(Dispatchers.Default) { Review("widgets/you/${Submit.slug(spec.name)}/widget.owl", text) }
+        val kind = spec.kind.word
+        value = withContext(Dispatchers.Default) { Review("${kind}s/you/${Submit.slug(spec.name)}/$kind.owl", text) }
     }
     var uploading by remember(text) { mutableStateOf(false) }
     var error by remember(text) { mutableStateOf<String?>(null) }
@@ -257,8 +268,8 @@ private fun StoreIssue(
         scope.launch {
             runCatching { withContext(Dispatchers.IO) { Paste.upload(text, userAgent(), Paste.STORE_DAYS) } }
                 .onSuccess { id ->
-                    val url = Submit.issueUrl(Market.REPO, spec.name, Catalog.metaText(spec.program?.meta?.get("description")).orEmpty(), id)
-                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    val url = Submit.issueUrl(Market.REPO, spec.name, Catalog.metaText(spec.program?.meta?.get("description")).orEmpty(), id, spec.kind)
+                    if (!context.openUrl(url)) error = "no browser to open $url"
                 }.onFailure { error = (it as? ShareError)?.message ?: "something went wrong" }
             uploading = false
         }
@@ -289,7 +300,7 @@ private fun qrImage(
     val file = File(dir, "$slug-qr.png")
     file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
     bitmap.recycle()
-    return FileProvider.getUriForFile(context, "dev.omalauncher.files", file)
+    return FileProvider.getUriForFile(context, context.packageName + ".files", file)
 }
 
 /** [link] as a QR code at error correction L, the setting [Share.MAX_LINK] is measured for, with a 2-module margin. */

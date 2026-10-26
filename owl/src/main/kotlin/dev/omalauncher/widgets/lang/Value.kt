@@ -1,5 +1,7 @@
 package dev.omalauncher.widgets.lang
 
+import java.math.BigDecimal
+
 /**
  * Runtime values of the widget language. Plain data with structural equality,
  * so a command that prints the same output twice invalidates nothing.
@@ -20,7 +22,20 @@ value class Num(
 ) : Value {
     override val truthy get() = v != 0.0 && !v.isNaN()
 
-    override fun toString() = if (v == Math.rint(v) && kotlin.math.abs(v) < 1e15) v.toLong().toString() else v.toString()
+    override fun toString(): String {
+        val a = kotlin.math.abs(v)
+        if (v == Math.rint(v) && a < 1e15) return v.toLong().toString()
+        // Double.toString writes these without an exponent already.
+        if (a >= 1e-3 && a < 1e7 || !v.isFinite()) return v.toString()
+        // As JavaScript writes numbers: plain from 1e-6 to 1e21, so a time with a fraction in a URL
+        // reads 1792231445.5 and not 1.7922314455E9; 1.5e-7 and 1e+21 past them.
+        val d = BigDecimal(v.toString()).stripTrailingZeros()
+        if (a >= 1e-6 && a < 1e21) return d.toPlainString()
+        val digits = d.unscaledValue().abs().toString()
+        val exp = digits.length - 1 - d.scale()
+        val mantissa = if (digits.length == 1) digits else digits[0] + "." + digits.substring(1)
+        return (if (v < 0) "-" else "") + mantissa + "e" + (if (exp >= 0) "+" else "") + exp
+    }
 }
 
 @JvmInline
@@ -55,7 +70,7 @@ data class Lst(
 ) : Value {
     override val truthy get() = items.isNotEmpty()
 
-    override fun toString() = items.joinToString(", ", "[", "]")
+    override fun toString() = StringBuilder().also { appendText(this, it) }.toString()
 }
 
 data class Obj(
@@ -63,7 +78,48 @@ data class Obj(
 ) : Value {
     override val truthy get() = fields.isNotEmpty()
 
-    override fun toString() = fields.entries.joinToString(", ", "{", "}") { "${it.key}: ${it.value}" }
+    override fun toString() = StringBuilder().also { appendText(this, it) }.toString()
+}
+
+/**
+ * The most text one value may hold, in characters. Doubling a text or a list of lists in a reduce takes a few
+ * steps of the budget and gigabytes of memory: a widget's value mustn't take the launcher down with an OutOfMemoryError.
+ */
+const val MAX_TEXT = 4 shl 20
+
+/** Throws when text of [length] characters would be over [MAX_TEXT]. */
+fun checkText(length: Int) {
+    if (length > MAX_TEXT) throw WidgetError("text over ${MAX_TEXT shr 20}M characters")
+}
+
+/** A list's or map's text, "[1, 2]" and "{a: 1}", stopping at [MAX_TEXT]: a list of itself repeated is small but its text isn't. */
+private fun appendText(
+    v: Value,
+    out: StringBuilder,
+) {
+    when (v) {
+        is Lst -> {
+            out.append('[')
+            v.items.forEachIndexed { i, x ->
+                if (i > 0) out.append(", ")
+                appendText(x, out)
+            }
+            out.append(']')
+        }
+        is Obj -> {
+            out.append('{')
+            var first = true
+            for ((k, x) in v.fields) {
+                if (!first) out.append(", ")
+                first = false
+                out.append(k).append(": ")
+                appendText(x, out)
+            }
+            out.append('}')
+        }
+        else -> out.append(v.toString())
+    }
+    checkText(out.length)
 }
 
 /** A gradient for fills: linear from (x0,y0) to (x1,y1), or radial around (x0,y0) with radius x1. */
@@ -106,6 +162,9 @@ fun Value.text(): String =
         is Str -> v.trimEnd().trimStart('\n', '\r')
         else -> toString()
     }
+
+/** The value as text, or null for no value or [Null]. */
+fun Value?.textOrNull(): String? = this?.takeIf { it != Null }?.toString()
 
 class WidgetError(
     message: String,

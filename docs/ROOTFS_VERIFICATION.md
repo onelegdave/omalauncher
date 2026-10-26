@@ -198,6 +198,56 @@ app has not received these fixes. A compatible APK and authorized device test
 are the next acceptance gate; a debug APK must not be assumed capable of
 updating a Play-signed installation without changing or losing application data.
 
+## Upstream integration, 26 October 2026
+
+The authenticated-rootfs commit `828c06c6debce28276c7a042d481450ee99a2cd1`
+was integrated locally with upstream
+`57fe9af991bc2d29ff7c885f4996055d4eaed691`. This preserves both histories;
+the earlier results above remain historical evidence for their original snapshot.
+
+The integration keeps pinned signature verification, bounded acquisition,
+contained staging, atomic activation and recovery, serialized removal and
+legacy-ready adoption. It retains upstream's guest fork check and streamed,
+SHA-256-checked cliamp installation. Explicit cancellation now reaches the
+authenticated path as well as coroutine cancellation, including large file and
+hard-link copies and the boundary before activation. HTTP disconnects are
+requested off the UI thread; existing connection/read timeouts bound a blocked
+platform operation. Space checks precede private copying, downloading and
+extraction. ENOSPC stops network retries. Journal reset still saves before
+changing memory and now uses `Versioned.writeFile`.
+
+Current verification used a separate plain Kotlin/JVM harness on Linux with
+Kotlin 2.4.21 and a checksum-verified, task-local JDK 25. It compiled the actual
+Bootstrap, rootfs, journal/versioning, managed-file/provisioning, HTTP and stream
+sources. Android Context/Log/Os and Proot/agent/pacman dependencies were explicit
+host adapters; the no-follow deletion function was copied unchanged from the
+production source. This is host wiring evidence, **not Android acceptance**.
+
+The final XML records **139 tests: 138 passed, zero failed/errors, one skipped**:
+
+- 133 repository rootfs tests, including seven new cancellation/storage
+  regressions. The optional real-image test was skipped.
+- The repository's StepJournal reset-order regression.
+- Five host-only Bootstrap wiring checks: completed/legacy cancellation guards,
+  legacy adoption, disk-space preflight, ENOSPC stopping retries, and cancellation
+  stopping the next step.
+
+Four negative controls removed the activation cancellation check, ENOSPC retry
+guard, journal save-before-reset ordering and large-file cancellation check in
+the isolated harness only. Each corresponding test failed; all changes were
+restored before the final passing run. The integration files pass the scoped
+Git whitespace check. The whole merge reports whitespace embedded in unchanged
+upstream PRoot/Mesa `.patch` files; those patches are preserved byte for byte.
+The pinned signing-key asset hash is unchanged.
+
+The full repository command, with Android SDK/toolchain auto-download disabled,
+was attempted and stopped at `:app` configuration because the Android SDK was
+absent. No Android license was accepted, SDK installed, APK assembled, release
+shrunk, app deployed or phone tested. Current ART, TLS, NIO/permission, lifecycle,
+device cancellation/recovery, native-binary and full-project lint acceptance
+remain open. No real upstream rootfs image was downloaded or executed for this
+integration. Publication remains a separate owner decision.
+
 ## Resume point
 
 Work is paused at the owner's request after saving the source, tests, and

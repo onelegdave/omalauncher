@@ -36,6 +36,7 @@ class RootfsInstaller(
     private val forgetOldRootfs: () -> Unit,
     /** Deletes a tree without following symlinks: LauncherData.deleteTree in the app. */
     private val deleteTree: (File) -> Unit,
+    private val beforeExtract: () -> Unit = {},
     private val report: (stage: Stage, step: String, progress: Float?) -> Unit = { _, _, _ -> },
 ) {
     val rootfs = File(filesDir, "arch")
@@ -55,15 +56,18 @@ class RootfsInstaller(
     fun install(
         source: RootfsSource,
         extractor: RootfsExtractor,
+        ensureActive: () -> Unit = {},
     ): Unit =
         synchronized(lock) {
-            installLocked(source, extractor)
+            installLocked(source, extractor, ensureActive)
         }
 
     private fun installLocked(
         source: RootfsSource,
         extractor: RootfsExtractor,
+        ensureActive: () -> Unit,
     ) {
+        ensureActive()
         check(!setUp()) { "refusing to replace a set-up system" }
         if (activated()) {
             source.clear()
@@ -71,9 +75,12 @@ class RootfsInstaller(
         }
         val verified = source.obtain()
         try {
+            ensureActive()
+            beforeExtract()
             report(Stage.Extract, "Starting", 0f)
             freshStaging()
             extractor.extract(verified, staging)
+            ensureActive()
             activate(verified.sha256)
         } catch (e: Throwable) {
             runCatching { deleteTree(staging) }

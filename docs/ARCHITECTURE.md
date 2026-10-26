@@ -27,13 +27,18 @@ touches it: `files/omarchy` is `~/.local/share/omarchy` and `files/widgets` is
   mapping, per-surface pixel stores, and compositing them into a window's
   `ANativeWindow`
 - `wayland/`: the Wayland server in Kotlin (wl_compositor, wl_shm,
-  wl_subcompositor, wl_seat, wl_output, xdg_wm_base, xdg-decoration) and
+  wl_subcompositor, wl_seat, wl_output, xdg_wm_base, xdg-decoration, and
+  text-input-v3 for where a client's text cursor is) and
   `WindowRenderer`, which draws one window into its activity's SurfaceView
   (or, for a widget's `Terminal`, into a TextureView in the tile)
 - `linux/`: proot, the rootfs setup and its update steps, pacman, coding
   agents, and the bridges to Android (audio, URLs, /proc)
 - `ui/`: the Compose home screen, the bar and its app list, settings and Files
-- `widgets/`: the widget engine; the language itself is in the `owl` module
+- `widgets/`: the widget engine; the language itself is in the `owl` module.
+  A widget's state and sources live in its `WidgetInstance`, which runs while
+  its page or a neighbour is on screen, but the pager composes only the
+  current page: a node drawn in Kotlin loses its `remember` state when its
+  page is swiped away, and keeps anything lasting in the instance
 - `theme/`: Omarchy themes, applied to the launcher and the guest
 - `upgrade/`: how installs follow app updates (see below)
 
@@ -49,19 +54,37 @@ drawing.
 
 ## GPU acceleration
 
-Opt-in, in settings › linux, on Mali GPUs (v10+: Pixel 7 and newer, recent
-MediaTek). Turning it on installs Mesa and the Vulkan loader with pacman and
-the pinned PanVK-kbase driver (a Mesa Vulkan driver for Android's
-`/dev/mali0`, from zenithblue-oss/panvk-kbase-android, checked against its
-sha256) into `/usr/local`, where pacman never touches it. OpenGL is Arch's
-stock Mesa on top of it, via zink. Frames still arrive as wl_shm buffers
+Opt-in, in settings › linux. The device node picks the driver. Mali (v10+:
+Pixel 7 and newer, recent MediaTek) uses the pinned PanVK-kbase driver on
+`/dev/mali0`, from zenithblue-oss/panvk-kbase-android. Adreno 6xx and newer
+use the pinned Turnip KGSL driver on `/dev/kgsl-3d0`, the Arch
+`vulkan-freedreno` package from lfdevs/mesa-for-android-container
+(turnip-26.3.0-devel-20260824). The model comes from
+`/sys/class/kgsl/kgsl-3d0/gpu_model`. An older Adreno, or a model that cannot
+be read, is not offered. Arch's own Mesa talks to DRM, so it would not see
+`/dev/kgsl-3d0`. Both blobs are checked against their sha256 and installed
+under `/usr/local`, and both ICD manifests live under
+`/usr/local/share/vulkan/icd.d`, which pacman does not own. A download that
+fails deletes its temp files on the way out. Turning one on also installs
+Mesa and the Vulkan loader with pacman. OpenGL is zink. On Adreno the guest
+uses a patched Mesa 26.2.4 libEGL (`scripts/mesa/0001-egl-wayland-keep-zink-on-shm.patch`):
+the compositor only offers `wl_shm`, stock Mesa clears zink after the Wayland
+DRM path fails, and the shm buffer stays black while frames still count.
+`MESA_LOADER_DRIVER_OVERRIDE=zink` keeps zink set so kopper presents through
+Vulkan WSI. The patched libraries live under `/usr/local/omalauncher-mesa`,
+off the default linker path. Frames still arrive as wl_shm buffers
 (`MESA_VK_WSI_DEBUG=sw`), so the compositor is the same either way.
 
 `linux/Gpu.kt` only switches guest apps to the GPU (`Proot.graphicsEnv`)
-after a check passes (vulkaninfo finds PanVK, eglinfo gets zink), and checks
-again after every system update; if that fails, apps render in software
-(llvmpipe) and settings offers a retry. One app can opt out with
-`GALLIUM_DRIVER=llvmpipe app`. Terminal apps (foot) draw on the CPU and
+after a check passes (vulkaninfo finds PanVK or Turnip, eglinfo gets zink),
+and checks again after every system update; if that fails, the ICD manifest
+is removed and apps render in software (llvmpipe). Software mode sets `VK_ICD_FILENAMES` and `VK_DRIVER_FILES` to a manifest
+that is never created, so the loader does not scan the default ICD
+directories. The loader prefers `VK_DRIVER_FILES`, so turning the GPU on
+sets both names to the real manifest. The check unsets the software values
+before it exports those. Settings offers a
+retry. One app can opt out with `GALLIUM_DRIVER=llvmpipe app`. Terminal apps
+(foot) draw on the CPU and
 don't change.
 
 ## Installing the rootfs
@@ -191,6 +214,18 @@ runs until it's in place; no guest command runs before.
   the leftover check run one at a time (`Bootstrap` and `RootfsInstaller`
   each hold a lock), and the leftover check finishes before Linux shows as
   not installed, so an install never starts while a deletion is running.
+
+- **Cancellation and storage.** An unfinished install can be cancelled through
+  the setup controls. Explicit cancellation and coroutine cancellation reach
+  download, private-copy, signature-verification and extraction checkpoints;
+  the active HTTP connection is disconnected where the platform permits it,
+  with connection/read timeouts bounding a blocked operation. Cancellation is
+  checked again before activation and before recording a finished step. Runtime
+  stops guest commands and joins installation before serialized removal. A
+  completed or legacy-ready system cannot be cancelled. Free-space checks run
+  before a download or private copy and before extraction; an ENOSPC write
+  failure stops network retries instead of downloading again. A valid cache is
+  retained when extraction runs out of room, and pushed originals stay intact.
 
 What it doesn't do: a valid signature says who published an image, not that
 it's the newest, so an older signed tarball (downloaded or pushed) would be

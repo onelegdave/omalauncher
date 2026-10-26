@@ -16,6 +16,29 @@ import java.net.URL
 import java.util.concurrent.CancellationException
 
 class RootfsDownloadTest {
+    @Test fun explicitCancelWhileWaitingForHeadersDoesNotBecomeANetworkRetry() {
+        val requested = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val s = server {
+            requested.countDown()
+            release.await(3, java.util.concurrent.TimeUnit.SECONDS)
+            Response(200, body)
+        }
+        val d = downloader(DownloadLimits(connectTimeoutMs = 500, readTimeoutMs = 500))
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<Throwable?> { runCatching { d.signature("${s.base}/a.sig") }.exceptionOrNull() }
+            assertTrue(requested.await(2, java.util.concurrent.TimeUnit.SECONDS))
+            d.cancel()
+            assertTrue(result.get(2, java.util.concurrent.TimeUnit.SECONDS) is CancellationException)
+            assertEquals(1, s.requests.size)
+            assertFalse(d.archive.exists())
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     @get:Rule val tmp = TemporaryFolder()
 
     private val body = ByteArray(300_000) { (it * 31 % 251).toByte() }

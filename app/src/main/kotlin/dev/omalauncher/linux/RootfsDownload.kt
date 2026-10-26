@@ -10,6 +10,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.concurrent.CancellationException
+import kotlin.concurrent.thread
 
 /** Upstream's name for the generic aarch64 rootfs; its detached signature is this plus ".sig". */
 const val ROOTFS_TARBALL = "ArchLinuxARM-aarch64-latest.tar.gz"
@@ -61,6 +63,25 @@ class RootfsDownloader(
     private val ensureActive: () -> Unit = {},
     private val progress: (done: Long, total: Long) -> Unit = { _, _ -> },
 ) {
+    @Volatile private var cancelled = false
+    @Volatile private var connection: HttpURLConnection? = null
+
+    /** Unblocks a header/body read where the platform permits it; timeouts bound the remaining wait. */
+    fun cancel() {
+        cancelled = true
+        connection?.let { conn -> thread(name = "rootfs-cancel", isDaemon = true) { runCatching { conn.disconnect() } } }
+    }
+
+    private fun checkActive() {
+        if (cancelled) throw CancellationException("cancelled")
+        ensureActive()
+    }
+
+    private fun disconnect(conn: HttpURLConnection) {
+        if (connection === conn) connection = null
+        conn.disconnect()
+    }
+
     /** A finished download, waiting to be verified. */
     val archive = File(cacheDir, ROOTFS_TARBALL)
     private val partial = File(cacheDir, "$ROOTFS_TARBALL.part")
@@ -71,6 +92,7 @@ class RootfsDownloader(
 
     /** The URL an unfinished download came from, so a retry can continue it there. */
     val partialUrl: String? get() = readInfo()?.url
+    val partialBytes: Long get() = if (partial.isFile && readInfo() != null) partial.length() else 0L
 
     /** The detached signature at [url], whole; it's small, so it's never resumed. */
     fun signature(url: String): ByteArray {
@@ -79,13 +101,14 @@ class RootfsDownloader(
             if (conn.responseCode != HttpURLConnection.HTTP_OK) throw network("the signature download failed: HTTP ${conn.responseCode}")
             checkIdentity(conn)
             if (conn.contentLengthLong > limits.maxSignatureBytes) throw network("the signature download is too big")
-            return conn.inputStream.use { readAtMost(it, limits.maxSignatureBytes) } ?: throw network("the signature download is too big")
+            return conn.inputStream.use { readAtMost(it, limits.maxSignatureBytes, ::checkActive) } ?: throw network("the signature download is too big")
         } catch (e: RootfsException) {
             throw e
         } catch (e: IOException) {
+            checkActive()
             throw network("the signature download failed: ${e.message}", e)
         } finally {
-            conn.disconnect()
+            disconnect(conn)
         }
     }
 
@@ -103,7 +126,7 @@ class RootfsDownloader(
         // After a reply that couldn't continue the partial file: ask for the whole file, which then replaces it.
         var whole = false
         while (true) {
-            ensureActive()
+            checkActive()
             val info = readInfo()?.takeIf { !whole && partial.isFile && it.ifRange(url) != null }
             val have = if (info != null) partial.length() else 0L
             if (info != null && info.total >= 0) {
@@ -173,11 +196,13 @@ class RootfsDownloader(
             } catch (e: RootfsException) {
                 throw e
             } catch (e: IOException) {
+                checkActive()
                 // Before any of the body: receive() reports its own failures.
                 throw network("the download failed (${e.message})", e)
             } finally {
-                conn.disconnect()
+                disconnect(conn)
             }
+            checkActive()
             return promote()
         }
     }
@@ -213,7 +238,7 @@ class RootfsDownloader(
                     var lastReport = 0L
                     progress(done, total)
                     while (true) {
-                        ensureActive()
+                        checkActive()
                         val n = input.read(buf)
                         if (n < 0) break
                         if (done + n > limits.maxArchiveBytes) {
@@ -234,6 +259,7 @@ class RootfsDownloader(
         } catch (e: RootfsException) {
             throw e
         } catch (e: IOException) {
+            checkActive()
             throw cut("the download was interrupted (${e.message})", e)
         }
     }
@@ -268,8 +294,10 @@ class RootfsDownloader(
     ): HttpURLConnection {
         var current = URL(url)
         for (hop in 0..limits.maxRedirects) {
+            checkActive()
             if (!allowed(current)) throw network("refusing to download from ${current.protocol}://${current.host}: not a secure address")
             val conn = current.openConnection() as HttpURLConnection
+            connection = conn
             conn.instanceFollowRedirects = false
             conn.connectTimeout = limits.connectTimeoutMs
             conn.readTimeout = limits.readTimeoutMs
@@ -279,14 +307,17 @@ class RootfsDownloader(
             setup(conn)
             val code =
                 try {
+                    checkActive()
                     conn.responseCode
-                } catch (e: IOException) {
-                    conn.disconnect()
-                    throw network("can't reach ${current.host} (${e.message})", e)
+                } catch (e: Throwable) {
+                    disconnect(conn)
+                    checkActive()
+                    if (e is IOException) throw network("can't reach ${current.host} (${e.message})", e)
+                    throw e
                 }
             if (code !in 300..399 || code == HttpURLConnection.HTTP_NOT_MODIFIED) return conn
             val location = conn.getHeaderField("Location")
-            conn.disconnect()
+            disconnect(conn)
             current = URL(current, location ?: throw network("a redirect without a target (HTTP $code)"))
         }
         throw network("too many redirects")
@@ -370,11 +401,13 @@ class RootfsDownloader(
 internal fun readAtMost(
     input: InputStream,
     max: Int,
+    ensureActive: () -> Unit = {},
 ): ByteArray? {
     // Not InputStream.readNBytes: Android has it only from API 33.
     val out = java.io.ByteArrayOutputStream()
     val buf = ByteArray(4096)
     while (true) {
+        ensureActive()
         val n = input.read(buf)
         if (n < 0) return out.toByteArray()
         out.write(buf, 0, n)
@@ -405,6 +438,8 @@ class RootfsSource(
     private val ensureActive: () -> Unit = {},
     /** The biggest tarball a user may push. */
     private val maxPushedBytes: Long = MAX_ARCHIVE_BYTES,
+    private val beforeDownload: () -> Unit = {},
+    private val beforeCopy: (bytes: Long) -> Unit = {},
     private val report: (step: String, progress: Float?) -> Unit = { _, _ -> },
 ) {
     /** The private copy of a pushed tarball: checked and unpacked from here, so changing the pushed file meanwhile can't matter. */
@@ -428,6 +463,7 @@ class RootfsSource(
      * a fresh pair, and comes last in later tries; at most [MAX_DOWNLOADS] tarballs per try.
      */
     fun obtain(): VerifiedRootfs {
+        ensureActive()
         val pushed = externalDir?.let { File(it, ROOTFS_TARBALL) }
         if (pushed != null && pushed.exists()) return fromPushed(pushed)
         var failure: RootfsException? = null
@@ -488,6 +524,7 @@ class RootfsSource(
             throw pushedProblem(e)
         }
         report("Copying the pushed tarball", null)
+        beforeCopy(pushed.length())
         try {
             snapshot.delete()
             pushed.inputStream().use { input ->
@@ -511,9 +548,10 @@ class RootfsSource(
                     out.fd.sync()
                 }
             }
-        } catch (e: IOException) {
+        } catch (e: Throwable) {
             snapshot.delete()
             if (e is RootfsException) throw e
+            if (e !is IOException) throw e
             throw RootfsException(RootfsException.Kind.Storage, "can't copy the pushed tarball", e)
         }
         return try {
@@ -572,7 +610,11 @@ class RootfsSource(
         )
     }
 
-    private fun download(url: String): File = downloader.download(url).also { downloads++ }
+    private fun download(url: String): File {
+        ensureActive()
+        beforeDownload()
+        return downloader.download(url).also { downloads++ }
+    }
 
     /** The signature at [sigUrl], once it's one the app could accept: a refused one costs no tarball download. */
     private fun signature(sigUrl: String): ByteArray {

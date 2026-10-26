@@ -133,7 +133,7 @@ class RootfsExtractor(
 
         fun run(archive: VerifiedRootfs): Int {
             val sha256 = MessageDigest.getInstance("SHA-256")
-            val compressed = Counting(DigestInputStream(archive.open(), sha256), Long.MAX_VALUE) { error("unreachable") }
+            val compressed = Counting(DigestInputStream(archive.open(), sha256), Long.MAX_VALUE, ensureActive) { error("unreachable") }
             val buffered = BufferedInputStream(compressed, 1 shl 16)
             var entries = 0
             try {
@@ -172,6 +172,7 @@ class RootfsExtractor(
             copyHardLinks()
             ensureActive()
             for ((path, target) in symlinks) {
+                ensureActive()
                 storage("can't create a symlink") { symlink(target, resolve(path).toString()) }
             }
             checkShape()
@@ -285,6 +286,7 @@ class RootfsExtractor(
             out.use {
                 var left = size
                 while (left > 0) {
+                    ensureActive()
                     val n = input.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
                     if (n < 0) throw format("is cut short")
                     storage("can't write a file") { out.write(buf, 0, n) }
@@ -295,6 +297,7 @@ class RootfsExtractor(
 
         private fun copyHardLinks() {
             for (name in hardLinks) {
+                ensureActive()
                 var target = (nodes[name] as HardLink).target
                 var node = nodes[target]
                 var depth = 0
@@ -309,7 +312,14 @@ class RootfsExtractor(
                         val path = resolve(name)
                         storage("can't copy a hard link") {
                             Files.newInputStream(resolve(target), LinkOption.NOFOLLOW_LINKS).use { input ->
-                                Files.newOutputStream(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS).use { input.copyTo(it) }
+                                Files.newOutputStream(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS).use { out ->
+                                    while (true) {
+                                        ensureActive()
+                                        val n = input.read(buf)
+                                        if (n < 0) break
+                                        out.write(buf, 0, n)
+                                    }
+                                }
                             }
                         }
                         chmod(path, fileMode(node.mode))
@@ -441,6 +451,7 @@ class RootfsExtractor(
     private class Counting(
         input: InputStream,
         private val max: Long,
+        private val ensureActive: () -> Unit = {},
         private val tooMuch: () -> Throwable,
     ) : FilterInputStream(input) {
         var count = 0L
@@ -460,6 +471,7 @@ class RootfsExtractor(
         override fun skip(n: Long): Long = super.skip(n).also { if (it > 0) add(it) }
 
         private fun add(n: Long) {
+            ensureActive()
             count += n
             if (count > max) throw tooMuch()
             if (count > fence) throw format("has more metadata before an entry than the launcher reads")

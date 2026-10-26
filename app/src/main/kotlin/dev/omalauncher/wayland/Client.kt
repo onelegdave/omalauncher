@@ -232,7 +232,10 @@ class Client(
                     work?.run() ?: break
                 }
                 if (len - pos > 0) {
-                    for (i in 0 until len - pos) buf.put(i, buf.get(pos + i))
+                    // Reads use absolute offsets, so only the bytes' place matters, not position or limit.
+                    buf.limit(len).position(pos)
+                    buf.compact()
+                    buf.clear()
                 }
                 len -= pos
             }
@@ -339,19 +342,3 @@ class Global(
     val version: Int,
     val bind: (Client, Int, Int) -> Resource,
 )
-
-/** An object we accept but whose requests we mostly ignore. */
-open class StubResource(
-    client: Client,
-    id: Int,
-    version: Int,
-    override val iface: String,
-    private val destructorOpcode: Int = 0,
-) : Resource(client, id, version) {
-    override fun request(
-        opcode: Int,
-        args: Args,
-    ) {
-        if (opcode == destructorOpcode) destroy()
-    }
-}

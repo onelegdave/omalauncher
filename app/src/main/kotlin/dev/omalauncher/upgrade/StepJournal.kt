@@ -18,9 +18,9 @@ class StepJournal(
         private set
 
     init {
-        (Versioned.read(file.takeIf { it.exists() }?.readText(), VERSION) as? JSONObject)?.let { data ->
+        Versioned.readFile(file, VERSION)?.let { data ->
             setupComplete = data.optBoolean("setup")
-            data.optJSONArray("done")?.let { a -> for (i in 0 until a.length()) done += a.getString(i) }
+            data.optJSONArray("done")?.let { done += it.strings() }
         }
     }
 
@@ -28,10 +28,6 @@ class StepJournal(
 
     fun mark(id: String) {
         if (done.add(id)) save()
-    }
-
-    fun forget(id: String) {
-        if (done.remove(id)) save()
     }
 
     fun completeSetup() {
@@ -49,10 +45,7 @@ class StepJournal(
     private fun save(
         setup: Boolean = setupComplete,
         ids: Collection<String> = done,
-    ) = writeAtomically(
-        file,
-        Versioned.write(VERSION, JSONObject().put("setup", setup).put("done", JSONArray(ids.sorted()))).toByteArray(),
-    )
+    ) = Versioned.writeFile(file, VERSION, JSONObject().put("setup", setup).put("done", JSONArray(ids.sorted())))
 
     private companion object {
         const val VERSION = 1

@@ -13,6 +13,44 @@ import org.junit.rules.TemporaryFolder
 import java.io.File
 
 class RootfsSourceTest {
+    @Test fun insufficientSpaceStopsBeforeDownloadingOrTryingAnotherMirror() {
+        val a = mirror(listOf(v1), listOf(sig1))
+        val b = mirror(listOf(v1), listOf(sig1))
+        val noSpace = java.io.IOException("ENOSPC")
+        val source = RootfsSource(
+            cache, null, signer.verifier(), RootfsDownloader(cache, allowed = { it.host == "127.0.0.1" }),
+            listOf(a.base + "/os/", b.base + "/os/"), beforeDownload = { throw noSpace },
+        )
+        assertTrue(assertThrows(java.io.IOException::class.java) { source.obtain() } === noSpace)
+        assertEquals(0, archiveRequests(a))
+        assertTrue(b.requests.isEmpty())
+    }
+
+    @Test fun insufficientSpaceForAPushedCopyPreservesTheExternalInput() {
+        File(external, ROOTFS_TARBALL).writeBytes(v1)
+        File(external, "$ROOTFS_TARBALL.sig").writeBytes(sig1)
+        val source = RootfsSource(
+            cache, external, signer.verifier(), RootfsDownloader(cache),
+            beforeCopy = { bytes -> assertEquals(v1.size.toLong(), bytes); throw java.io.IOException("ENOSPC") },
+        )
+        assertThrows(java.io.IOException::class.java) { source.obtain() }
+        assertArrayEquals(v1, File(external, ROOTFS_TARBALL).readBytes())
+        assertFalse(source.snapshot.exists())
+    }
+
+    @Test fun cancellationDuringAPushedCopyDropsOnlyThePrivateSnapshot() {
+        File(external, ROOTFS_TARBALL).writeBytes(v1)
+        File(external, "$ROOTFS_TARBALL.sig").writeBytes(sig1)
+        var checks = 0
+        val source = RootfsSource(
+            cache, external, signer.verifier(), RootfsDownloader(cache),
+            ensureActive = { if (++checks > 2) throw java.util.concurrent.CancellationException("stop") },
+        )
+        assertThrows(java.util.concurrent.CancellationException::class.java) { source.obtain() }
+        assertFalse(source.snapshot.exists())
+        assertArrayEquals(v1, File(external, ROOTFS_TARBALL).readBytes())
+    }
+
     @get:Rule val tmp = TemporaryFolder()
 
     private val signer = TestSigner.trusted

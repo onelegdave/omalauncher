@@ -6,9 +6,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import dev.omalauncher.upgrade.Versioned
 import dev.omalauncher.upgrade.mapObjects
-import dev.omalauncher.upgrade.writeAtomically
+import dev.omalauncher.upgrade.strings
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -31,6 +30,7 @@ data class ToolUpdate(
 
 /** What the last check found. [error] is set when it couldn't reach the mirrors. */
 data class PendingUpdates(
+    /** Each as "name old → new"; a result saved before versions were kept has just names. */
     val packages: List<String>,
     val tools: List<ToolUpdate>,
     val checkedAt: Long,
@@ -63,10 +63,10 @@ class SystemUpdates(
 
     /** Reads the last result, so the settings dot shows right after a restart. */
     fun load() {
-        val data = Versioned.read(file.takeIf { it.exists() }?.readText(), VERSION) as? JSONObject ?: return
+        val data = Versioned.readFile(file, VERSION) ?: return
         pending =
             PendingUpdates(
-                packages = data.optJSONArray("packages")?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty(),
+                packages = data.optJSONArray("packages")?.strings().orEmpty(),
                 tools =
                     data.optJSONArray("tools")?.mapObjects { ToolUpdate(it.getString("name"), it.getString("current"), it.getString("latest")) }.orEmpty(),
                 checkedAt = data.optLong("checkedAt"),
@@ -117,7 +117,7 @@ class SystemUpdates(
                 .map { it.trim() }
                 // "name old -> new"
                 .filter { it.contains(" -> ") }
-                .map { it.substringBefore(' ') }
+                .map { it.replace(" -> ", " → ") }
         return PendingUpdates(packages, parseMise(text.substringAfter("#mise\n", "")), now)
     }
 
@@ -138,22 +138,13 @@ class SystemUpdates(
                 .put("packages", JSONArray(p.packages))
                 .put("tools", JSONArray(p.tools.map { JSONObject().put("name", it.name).put("current", it.current).put("latest", it.latest) }))
                 .put("checkedAt", p.checkedAt)
-        runCatching { writeAtomically(file, Versioned.write(VERSION, data).toByteArray()) }
+        runCatching { Versioned.writeFile(file, VERSION, data) }
     }
 
     /** Upgrades everything: a full pacman sync, then mise's tools. Returns whether it worked. */
     suspend fun updateAll(): Boolean {
         if (job is JobState.Working) return false
-        job = JobState.Working("waiting", emptyList())
-        val ok =
-            pacman.lock.withLock {
-                withContext(Dispatchers.IO) {
-                    job = JobState.Working("updating", emptyList())
-                    val (ok, tail) = proot.runJob(UPDATE_SCRIPT) { job = JobState.Working("updating", it) }
-                    job = if (ok) JobState.Idle else JobState.Failed(tail.toList())
-                    ok
-                }
-            }
+        val (ok, _) = proot.trackedJob("updating", UPDATE_SCRIPT, pacman.lock) { job = it }
         // Agents may have changed, and what's left to update is worth knowing either way.
         withContext(Dispatchers.IO) { agents.load() }
         check(force = true)
@@ -184,9 +175,14 @@ class SystemUpdates(
             true
             """.trimIndent()
 
-        /** Databases refreshed (-Syy) even if pacman thinks they're current: mirrors lag each other. */
+        /**
+         * Databases refreshed (-Syy) even if pacman thinks they're current: mirrors lag each other. The old
+         * versions go even when one tool fails to upgrade, or every updated agent stays installed twice
+         * (1.1 GB); the tool that failed keeps its old version, since its config still selects it.
+         */
         val UPDATE_SCRIPT =
             "pacman -Syyu --noconfirm && $CLEAN_PACMAN_CACHE && " +
-                "if command -v mise >/dev/null; then mise upgrade && mise prune -y && mise cache clear; fi"
+                "if command -v mise >/dev/null; then $MISE_SELF_UPDATE && $MISE_NODE_FOR_AGENTS && mise upgrade; " +
+                "ok=\$?; $MISE_PRUNE; $MISE_CLEANUP; [ \$ok -eq 0 ]; fi"
     }
 }

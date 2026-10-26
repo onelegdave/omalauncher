@@ -18,6 +18,20 @@ import java.nio.file.LinkOption
 import java.nio.file.attribute.PosixFilePermissions
 
 class RootfsExtractorTest {
+    @Test fun cancellationStopsInsideALargeFileBeforeItIsFullyWritten() {
+        val size = 4_000_000L
+        val large = File(staging, "usr/share/large")
+        val data = TarFixture.minimalRootfs().sized("./usr/share/large", size).gz()
+        verified(File(tmp.root, "archive-cancel"), data).use { archive ->
+            val extractor = RootfsExtractor(ensureActive = {
+                if (large.length() > 0) throw java.util.concurrent.CancellationException("stop")
+            })
+            assertThrows(java.util.concurrent.CancellationException::class.java) { extractor.extract(archive, staging) }
+        }
+        assertTrue(large.length() in 1 until size)
+        assertEquals("untouched", sentinel.readText())
+    }
+
     @get:Rule val tmp = TemporaryFolder()
 
     private lateinit var staging: File

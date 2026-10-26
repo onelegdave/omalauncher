@@ -113,6 +113,7 @@ class RootfsVerifier(
         ensureActive: () -> Unit = {},
         progress: (done: Long, total: Long) -> Unit = { _, _ -> },
     ): VerifiedRootfs {
+        ensureActive()
         val sig = parse(signature)
         val channel =
             try {
@@ -143,6 +144,7 @@ class RootfsVerifier(
             if (done == 0L || !sig.verify()) {
                 throw RootfsException(RootfsException.Kind.Mismatch, "the tarball doesn't match its signature")
             }
+            ensureActive()
             return VerifiedRootfs(channel, sha256.digest(), done)
         } catch (e: Throwable) {
             channel.close()
